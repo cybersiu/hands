@@ -57,9 +57,10 @@ Chrome's approval-mode debugging serves **one client at a time**. While an MCP
 server holds the connection, a second client — another MCP server, or a script
 that calls `attach()` directly — cannot connect; its handshake times out.
 
-That is why `bench.py` warns before running: it opens its own connection, so it
-only works when nothing else is attached. Plan around the constraint rather than
-fighting it: run one MCP server and drive everything through its tools.
+That is why a second script cannot attach while the server is running: it opens
+its own connection and only works when nothing else holds one. Plan around the
+constraint rather than fighting it: run one MCP server and drive everything
+through its tools.
 
 ## Three things that will waste your afternoon
 
@@ -310,11 +311,7 @@ not a reused session id.
 
 ```bash
 pip install zendriver mcp
-python test_hands.py        # 20 checks against a local fixture
 ```
-
-`test_hands.py` starts its own HTTP servers on free ports and drives a real
-Chrome. It needs a desktop session; headless mode is not exercised.
 
 ## Requirements
 
