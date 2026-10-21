@@ -687,15 +687,19 @@ async def attach(
 
     if own_tab:
         try:
+            # Create the tab blank, then navigate through the same path every
+            # other navigation uses. ``Target.createTarget`` with a URL returns
+            # before that URL commits, so attaching straight to it hands the
+            # caller an about:blank document that looks like an empty page.
             made = await socket.send(
-                "Target.createTarget", {"url": start_url}
+                "Target.createTarget", {"url": "about:blank"}
             )
         except Exception as exc:
             await socket.close()
             raise AttachError(f"Could not open a work tab: {exc}") from exc
         chosen = {
             "targetId": made["targetId"],
-            "url": start_url,
+            "url": "about:blank",
             "title": "",
             "type": "page",
         }
@@ -729,13 +733,31 @@ async def attach(
     if hasattr(session, "_headless"):
         session._headless = False
 
+    # The tab exists before its page does. Navigating through ``tab.get`` uses
+    # the same commit-and-settle contract as every other navigation, so the
+    # first observe() sees a document rather than about:blank. A page that
+    # fails to load is reported, not hidden.
+    loaded, load_error = True, None
+    if created_tab and start_url not in ("", "about:blank"):
+        try:
+            await tab.get(start_url, timeout=timeout)
+        except Exception as exc:
+            loaded, load_error = False, str(exc)
+
+    live_url = chosen.get("url")
+    with contextlib.suppress(Exception):
+        live_url = await tab.evaluate("location.href") or live_url
+    chosen["url"] = live_url
+
     return {
         "attached": True,
         "endpoint": ws_url,
         "browser": version.get("product"),
         "tabs": len(pages),
         "created_tab": created_tab,
-        "active_url": chosen.get("url"),
+        "loaded": loaded,
+        "load_error": load_error,
+        "active_url": live_url,
         "active_title": chosen.get("title"),
         "tab_list": [
             {"index": i, "title": p.get("title"), "url": p.get("url")}
