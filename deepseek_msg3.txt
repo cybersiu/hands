@@ -1,0 +1,38 @@
+延續同一個 thread。先報結果，再補背景，最後問四條。
+
+【一、你上次抓到的 bug，確認係真】
+我原本寫：
+    if settled >= 2 or state["ready"] == "complete":
+        return
+你指出「第一次 moved && complete 就 return，settled 根本冇機會生效」。完全正確，我加的雙重確認係死代碼。已改成：
+- identity = (location.href, performance.timeOrigin, loaderId)，由 Page.getFrameTree 讀 loaderId
+- identity 要連續 240ms 不變，而且 readyState 離開 loading，才算 settle
+- href 讀不到（context 已銷毀）一律不當作 settled
+- 200ms 靜默窗口新增兩個測試：redirect hop 不准提早收工、空 href 不准當完成
+單元測試 8/8；接上真 Chrome 的 live test 4/4（example.com、同 URL reload、google.com→www.google.com、回報值 == location.href）。
+
+【二、你之前冇見過的背景：這個工具的完整形狀】
+1. 19 個 MCP tool。核心五個：observe、click、type_text、press、navigate。另有 assert_changed、dismiss_blocker、screenshot、tabs/switch_tab/new_tab、evaluate、scroll。
+2. observe 的實現：DOM.getDocument(depth=-1, pierce=True) 拿全棵樹，自己在 Python 內 flatten，只保留可互動元素（a/button/input/select/textarea/option/[role]/[onclick]/[contenteditable]），每個回傳 ref、tag、text、role/name、以及 viewport 座標（x/y/width/height）。實測 4-75ms，視 DOM 大小。
+3. 完全沒有 per-site selector。目標選擇靠打分：type=search、name=q、role=searchbox、y<120、width>200、文字含 search/搜尋。YouTube 與 Bing 都是這樣找搜尋框。
+4. click 會回傳 hit report：用 document.elementFromPoint 看座標上實際是什麼、有沒有 element 蓋住（blocked/blocker/blocker_text）。原因：Colab 的 mdc-dialog__scrim 會吞掉所有點擊，CDP 照樣回 success。
+5. 兩個已記錄的「假成功」：modal 吞點擊；click 成功但 app 拒絕（runtime 斷線、權限不足）。
+6. 固定/sticky 元素（例如 Wikipedia 的 #searchInput 在 y=0）DOM.getContentQuads 回空陣列，要用 DOM.resolveNode + Runtime.callFunctionOn(getBoundingClientRect) 補。
+7. Shadow DOM：pierce 讀得到，但 fixture 裡 dialog 的按鈕是 light DOM slot 進去，只在 shadow root 找會找到 dialog 卻找不到出口。
+8. 有一個 27 項的本地 fixture 測試，故意做敵意頁面：nested iframes、延遲出現的 modal、sticky header、shadow dialog、iframe 內的表單。
+9. 實測成本：observe 4-75ms、click 32-156ms、navigate 約 1.2s、每次重新 attach 2.5-3s。所以目標是一個長連線做完所有事。
+10. Chrome 148 approval mode 一次只服務一個 client，重複 connect/disconnect 會耗盡 quota，要人手重新批准。這是整個設計的前提。
+
+【三、我未做、正在考慮的四件事】
+A. click 仍然用 before/after URL 判斷「有冇效果」。SPA 開 modal、URL 不變但成功；只發 analytics 的按鈕也可能成功。
+B. navigate 只保證 document ready，不保證 app ready（SPA hydration、lazy data）。
+C. iframe 內導航：我讀的是主 frame 的 location.href，iframe 內部換頁會令等待 timeout。
+D. observe 在大型頁面（1000+ 節點）會不會有更好的做法。
+
+【四、請答】
+1. click 應該回傳什麼結構，才對「LLM agent」真正有用？不要人類 UI 的講法，講 agent 拿到之後可以怎樣決策。你認為最少需要幾個欄位？
+2. B 項：實務上 app-ready 有哪個信號值得等？network idle 我試過不可靠（長連接、websocket、analytics 一直有請求）。請給可實作的判準。
+3. C 項：flat session 下，nested iframe（包括 OOPIF）應該怎樣處理？要為每個 frame 開 Target session，還是有更輕的做法？我只需要讀文字和點擊，不需要攔截網絡。
+4. D 項：DOM.getDocument(pierce=true) 對比 DOMSnapshot.captureSnapshot，在「要拿幾何座標 + 要跨 shadow DOM」這兩個前提下，哪個更適合？為什麼？
+
+請直接答，講結論與理由，不要客套。

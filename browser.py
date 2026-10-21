@@ -1550,6 +1550,19 @@ class Session:
         return {"index": index, "url": await self._safe_url(),
                 "title": await self.title()}
 
+    async def close_active(self) -> dict[str, Any]:
+        """Close the tab this session is driving.
+
+        Used by callers that opened a tab only to read something and do not
+        want to leave it behind.
+        """
+        tab = self._require_tab()
+        with contextlib.suppress(Exception):
+            await tab.close()
+        self._tab = None
+        self._targets.clear()
+        return {"closed": True}
+
     async def new_tab(self, url: str = "about:blank") -> dict[str, Any]:
         browser = self._browser
         if browser is None:

@@ -122,6 +122,8 @@ async def attach(
     ws_url: str | None = None,
     tab_index: int | None = None,
     target_id: str | None = None,
+    own_tab: bool | None = None,
+    start_url: str = "about:blank",
 ) -> dict[str, Any]:
     """Attach to the Chrome the user is already using.
 
@@ -139,10 +141,16 @@ async def attach(
         user_data_dir: Chrome profile root holding ``DevToolsActivePort``.
             Defaults to the platform's standard Chrome profile.
         ws_url: Explicit WebSocket endpoint, overriding ``user_data_dir``.
-        tab_index: Which tab to drive, by position. Defaults to the first real
-            page (skipping blank tabs).
+        tab_index: Which tab to drive, by position. Ignored when ``own_tab`` is
+            true.
         target_id: Which tab to drive, by CDP target id. Takes precedence over
-            ``tab_index``.
+            ``tab_index``. Ignored when ``own_tab`` is true.
+        own_tab: Open a new tab instead of reusing one. Leave unset to reuse a
+            tab already on the same site as ``start_url``, and otherwise open
+            a new one. Reusing keeps the page the user was reading; opening a
+            tab avoids replacing one on a different site.
+        start_url: Page for the tab. Used to decide whether an open tab can be
+            reused, and loaded when a new tab is opened.
 
     Returns the browser version, the tab list, and which tab is now active.
     """
@@ -152,6 +160,8 @@ async def attach(
         ws_url=ws_url,
         tab_index=tab_index,
         target_id=target_id,
+        own_tab=own_tab,
+        start_url=start_url,
     )
 
 

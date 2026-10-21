@@ -1,19 +1,26 @@
-"""ask_deepseek.py — send one message to chat.deepseek.com and read the reply.
+"""ask_deepseek.py — continue a DeepSeek conversation from a file.
 
-This is the script form of what the MCP tools do: attach to the running Chrome,
-open a fresh chat, type, submit, then wait until the answer stops growing.
-It exists because the MCP server is currently stopped, and because a file is a
-much safer way to carry a few thousand characters of Chinese than a shell
-argument.
+Modes
+-----
+    python ask_deepseek.py --list
+        Print the chat history entries (title + url) so an old thread can be
+        found again.
 
-    python ask_deepseek.py message.txt answer.txt
+    python ask_deepseek.py MESSAGE.txt ANSWER.txt
+        Start a new chat and send MESSAGE.txt.
+
+    python ask_deepseek.py --chat URL MESSAGE.txt ANSWER.txt
+        Open an existing conversation and send into it, so the model keeps the
+        context from earlier turns.
+
+The answer is written as UTF-8 because the Windows console cannot print CJK.
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import io
-import json
 import sys
 from pathlib import Path
 
@@ -29,6 +36,19 @@ READ_JS = """(() => {
     .some(b => /停止|Stop/.test((b.getAttribute('aria-label') || '') +
                                 (b.innerText || '')));
   return { blocks: els.length, len: text.length, stop, text };
+})()"""
+
+HISTORY_JS = """(() => {
+  const out = [];
+  const seen = new Set();
+  document.querySelectorAll('a[href*="/a/chat/s/"]').forEach(a => {
+    const href = a.getAttribute('href') || '';
+    if (!href || seen.has(href)) return;
+    seen.add(href);
+    out.push({ href,
+               text: (a.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 90) });
+  });
+  return out;
 })()"""
 
 
@@ -56,36 +76,79 @@ async def wait_answer(session: Session, max_rounds: int = 12) -> dict:
 
 
 async def main() -> int:
-    if len(sys.argv) < 2:
-        print("usage: python ask_deepseek.py MESSAGE.txt [ANSWER.txt]")
-        return 1
-    message = Path(sys.argv[1]).read_text(encoding="utf-8")
-    out_path = Path(sys.argv[2]) if len(sys.argv) > 2 else None
+    ap = argparse.ArgumentParser()
+    ap.add_argument("message", nargs="?")
+    ap.add_argument("answer", nargs="?")
+    ap.add_argument("--chat", default=None, help="Existing conversation URL")
+    ap.add_argument("--list", action="store_true", help="List chat history")
+    ap.add_argument("--dump", action="store_true",
+                    help="With --chat, print that conversation's questions")
+    args = ap.parse_args()
 
     session = Session()
-    sock = attach.BrowserSocket(attach.ws_endpoint())
+    target = args.chat or "https://chat.deepseek.com/"
+
     try:
-        await sock.connect(timeout=8)
-    except Exception as exc:
+        # Reuse an open DeepSeek tab when there is one; never navigate some
+        # other site's tab to get here.
+        info = await attach.attach(session, start_url=target, timeout=60)
+    except attach.AttachError as exc:
         print(f"cannot attach: {exc}")
         return 2
 
     try:
-        pages = await attach.list_targets(sock)
-        idx = next((i for i, p in enumerate(pages)
-                    if "deepseek.com" in (p.get("url") or "")), None)
-        if idx is None:
-            idx = next((i for i, p in enumerate(pages)
-                        if not (p.get("url") or "").startswith("devtools://")), 0)
-        await attach.attach(session, tab_index=idx)
+        print(f"tab: {'reused' if not info.get('created_tab') else 'new'} "
+              f"({info.get('tabs')} open)")
 
-        await session.navigate("https://chat.deepseek.com/", timeout=30)
+        if args.chat:
+            current = await session.evaluate("location.href")
+            if (current or "").rstrip("/") != target.rstrip("/"):
+                await session.navigate(target, timeout=30)
+
+        if args.list:
+            await session.assert_changed(
+                "document.querySelectorAll('a[href*=\"/a/chat/s/\"]').length > 0",
+                timeout=20,
+            )
+            for entry in await session.evaluate(HISTORY_JS):
+                print(f"{entry['href']}\t{entry['text']}")
+            if info.get("created_tab"):
+                await session.close_active()
+            return 0
+
+        if args.dump:
+            await session.assert_changed(
+                "document.querySelectorAll('div.ds-message').length > 0",
+                timeout=20,
+            )
+            turns = await session.evaluate("""(() => {
+              const out = [];
+              document.querySelectorAll('div.ds-message').forEach(m => {
+                const t = (m.innerText || '').replace(/\\s+/g, ' ').trim();
+                const isUser = !!m.querySelector('.fbb737a4');
+                if (t) out.push({ user: isUser, len: t.length,
+                                  text: t.slice(0, 160) });
+              });
+              return out.slice(0, 8);
+            })()""")
+            for turn in turns:
+                print(f"{'USER' if turn['user'] else 'BOT ':>4} "
+                      f"{turn['len']:>5}  {turn['text']}")
+            if info.get("created_tab"):
+                await session.close_active()
+            return 0
+
+        if not args.message:
+            print("usage: ask_deepseek.py MESSAGE.txt [ANSWER.txt]")
+            return 1
+
         await session.assert_changed(
             "!!document.querySelector('textarea') && "
             "document.querySelector('textarea').offsetWidth > 100",
             timeout=20,
         )
 
+        message = Path(args.message).read_text(encoding="utf-8")
         obs = await session.observe(max_nodes=250)
         field = next((e for e in obs["elements"] if e["tag"] == "textarea"), None)
         if field is None:
@@ -105,6 +168,7 @@ async def main() -> int:
         text = answer.get("text", "")
         print(f"answer: {len(text)} chars")
 
+        out_path = Path(args.answer) if args.answer else None
         if out_path is not None:
             out_path.write_text(text, encoding="utf-8")
             print(f"written: {out_path}")
@@ -112,7 +176,7 @@ async def main() -> int:
             print(text)
         return 0 if text else 4
     finally:
-        await sock.close()
+        await session.stop()
 
 
 if __name__ == "__main__":

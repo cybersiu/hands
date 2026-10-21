@@ -49,6 +49,7 @@ import os
 import sys
 from pathlib import Path
 from typing import Any, Generator
+from urllib.parse import urlparse
 
 # --------------------------------------------------------------------------
 # Errors
@@ -116,6 +117,19 @@ def ws_endpoint(user_data_dir: Path | str | None = None) -> str:
     """Full WebSocket URL for the running Chrome."""
     port, path = read_devtools_port(user_data_dir)
     return f"ws://127.0.0.1:{port}{path}"
+
+
+def _site(url: str) -> str:
+    """Host of ``url``, with a leading ``www.`` removed.
+
+    Used only to decide whether an open tab is already on the site the caller
+    wants, so that a second visit reuses it instead of opening another tab.
+    """
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return ""
+    return host[4:] if host.startswith("www.") else host
 
 
 # --------------------------------------------------------------------------
@@ -608,8 +622,18 @@ async def attach(
     timeout: float = 15.0,
     tab_index: int | None = None,
     target_id: str | None = None,
+    own_tab: bool | None = None,
+    start_url: str = "about:blank",
 ) -> dict[str, Any]:
     """Attach ``session`` to a running Chrome and select a tab.
+
+    Tab policy, in order:
+
+    * ``target_id`` / ``tab_index`` — drive that tab, deliberately.
+    * ``own_tab=None`` (default) — reuse an open tab on the same site as
+      ``start_url``; otherwise open a new one. Reusing keeps the user's reading
+      position; opening a tab avoids overwriting a page on some other site.
+    * ``own_tab=True`` / ``False`` — force one behaviour.
 
     Returns a summary safe to hand to an agent: endpoint, tab count, and the
     selected tab's URL and title.
@@ -641,12 +665,43 @@ async def attach(
         ) from exc
 
     pages = await list_targets(socket)
-    if not pages:
+    if not pages and own_tab is False:
         await socket.close()
         raise AttachError("Chrome is running but has no page targets open.")
 
-    # Pick a tab: explicit target id, explicit index, then the first real page.
-    if target_id is not None:
+    # Pick a tab: an explicit one, a tab already on the target site, or a fresh
+    # one. Reusing keeps the user's place; opening a tab instead of navigating
+    # theirs avoids replacing a page they were reading.
+    created_tab = False
+    if own_tab is None:
+        host = _site(start_url)
+        match = None
+        if host:
+            match = next((p for p in pages
+                          if _site(p.get("url") or "") == host), None)
+        if match is not None:
+            chosen = match
+            own_tab = False
+        else:
+            own_tab = True
+
+    if own_tab:
+        try:
+            made = await socket.send(
+                "Target.createTarget", {"url": start_url}
+            )
+        except Exception as exc:
+            await socket.close()
+            raise AttachError(f"Could not open a work tab: {exc}") from exc
+        chosen = {
+            "targetId": made["targetId"],
+            "url": start_url,
+            "title": "",
+            "type": "page",
+        }
+        pages = pages + [chosen]
+        created_tab = True
+    elif target_id is not None:
         chosen = next((p for p in pages if p["targetId"] == target_id), None)
         if chosen is None:
             await socket.close()
@@ -660,11 +715,7 @@ async def attach(
                 f"No tab at index {tab_index}; {len(pages)} page(s) open."
             ) from exc
     else:
-        chosen = next(
-            (p for p in pages
-             if p.get("url") not in ("about:blank", "chrome://newtab/", "")),
-            pages[0],
-        )
+        chosen = pages[0]
 
     try:
         tab = await open_session(socket, chosen["targetId"], chosen)
@@ -683,6 +734,7 @@ async def attach(
         "endpoint": ws_url,
         "browser": version.get("product"),
         "tabs": len(pages),
+        "created_tab": created_tab,
         "active_url": chosen.get("url"),
         "active_title": chosen.get("title"),
         "tab_list": [
@@ -708,6 +760,15 @@ class _BrowserShim:
         self._session = session
         self.tabs: list[RawTab] = [RawTab(socket, p["targetId"], "", p)
                                    for p in pages]
+
+    async def stop(self) -> None:
+        """Close the connection, leaving every tab open.
+
+        ``browser.py`` calls ``stop()`` when a session ends. For an attached
+        browser that must mean "let go", never "quit Chrome" or "close the
+        user's tabs".
+        """
+        await self._socket.close()
 
     def _info_for(self, target_id: str) -> dict[str, Any]:
         return next((p for p in self._pages if p["targetId"] == target_id), {})

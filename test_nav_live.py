@@ -33,10 +33,8 @@ async def main() -> int:
     ok = 0
     total = 0
     try:
-        pages = await attach.list_targets(sock)
-        idx = next((i for i, p in enumerate(pages)
-                    if not (p.get("url") or "").startswith("devtools://")), 0)
-        await attach.attach(session, tab_index=idx)
+        # A dedicated tab, so a test never overwrites what the user was reading.
+        await attach.attach(session, start_url="https://example.com/")
 
         async def check(label, coro, predicate):
             nonlocal ok, total

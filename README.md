@@ -35,9 +35,16 @@ Chrome with `python import_profile.py --close-chrome` to inherit logins.
 copying, no re-authentication:
 
 ```python
-attach()               # first real tab
-attach(tab_index=2)    # a specific tab
+attach()               # reuse a tab on the same site, else open one
+attach(tab_index=2)    # a specific tab, deliberately
+attach(own_tab=True)   # always open a fresh tab
 ```
+
+`attach()` never navigates a tab it did not open. If a tab is already on the
+site you asked for, it is reused — so a workflow that runs twice does not leave
+a trail of duplicate tabs. If no tab matches, a new one is opened rather than
+replacing whatever the user was reading. Navigating a reused tab to a different
+site is the one thing that cannot be undone, so it is never implicit.
 
 Attaching requires, once, in Chrome:
 
