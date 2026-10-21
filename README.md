@@ -72,6 +72,7 @@ accepts the click, `click` reports success, and the page does not move.
 {
   "clicked": true,
   "target": "button 'Run all'",
+  "url_changed": false,
   "hit": {
     "blocked": true,
     "blocker": "mwc-dialog",
@@ -82,14 +83,18 @@ accepts the click, `click` reports success, and the page does not move.
 }
 ```
 
-**Check `hit.blocked` before believing a click worked.** To clear the overlay,
-find the dialog's buttons — they are usually slotted from the light DOM, not
-inside the shadow root:
+**Check `hit.blocked` before believing a click worked.** To clear the overlay:
 
-```javascript
-document.querySelector('mwc-dialog.yes-no-dialog')
-        .querySelectorAll('md-text-button')   // 關閉 / 重新連線
+```python
+dismiss_blocker()                 # closes it, reports which button it chose
+dismiss_blocker(dry_run=True)     # see the dialog and its buttons first
+click(ref="e19", auto_dismiss=True)  # close then retry, in one call
 ```
+
+The buttons are usually slotted from the light DOM, not inside the dialog's
+shadow root, so a shadow-only search finds the dialog but no way out.
+`dismiss_blocker` walks both, and prefers a secondary action (Close, Cancel,
+Later) over a primary one so it does not confirm a destructive choice.
 
 ### A click that lands is not an action that happened
 
@@ -97,10 +102,21 @@ The button receives the event, the handler runs, and the app still refuses —
 because the runtime is disconnected, a permission is missing, or the notebook
 is read-only. Nothing in the click path can detect that.
 
-Use `assert_changed` to check observable state instead of assuming:
+Every `click` therefore reports `url_before`, `url_after` and `url_changed`.
+Navigation is the one effect a handler cannot fake by ignoring the event.
 
 ```python
-click(ref="e19")
+click(ref="e19", retry=2)
+# attempt 1: url unchanged
+# attempt 2: url unchanged
+# attempt 3: page reloaded first, then clicked
+# {"url_changed": false, "attempts": [...],
+#  "note": "The URL did not change. If the click was meant to navigate, …"}
+```
+
+For anything subtler than navigation, use `assert_changed`:
+
+```python
 assert_changed("document.querySelectorAll('.cell.execution-count').length > 0")
 # {"changed": false, "elapsed": 5.0, "hint": "The condition never became true…"}
 ```
@@ -113,8 +129,23 @@ effect, and you now know to inspect the page rather than retry blindly.
 > A tool call succeeding proves the transport worked, not that the page did
 > what you wanted.
 
-Verify with `observe`, `assert_changed`, or a read-back `evaluate`. Never infer
-success from a return value alone.
+Verify with `observe`, `url_changed`, `assert_changed`, or a read-back
+`evaluate`. Never infer success from a return value alone.
+
+### What not to copy from scraper bots
+
+Ticket and sneaker bots ship elaborate CAPTCHA bypass stacks — DOM pierce to
+find the widget, then hardcoded pixel offsets (`click_x = iframe_x + 30`), then
+template matching. Two reasons not to imitate that:
+
+1. It is tied to one vendor's layout. Cloudflare moves the checkbox and every
+   offset is wrong; hCaptcha and reCAPTCHA need entirely different code.
+2. It is a bypass, not an interaction. A general-purpose hand should not carry
+   a CAPTCHA breaker.
+
+The one idea worth taking is the *verification* step at the end of those
+loops — click, wait, then check that the challenge is actually gone. That is
+what `assert_changed` and `url_changed` do, without hardcoding anyone's HTML.
 
 ## Why this exists
 
@@ -146,7 +177,8 @@ This server takes a different path.
 | `stop` | Close it. |
 | `navigate` | Go to a URL. |
 | `observe` | List interactable elements with coordinates. **The main way to see a page.** |
-| `click` | Click by `ref` or by `x`/`y`. Returns a `hit` report showing what was actually under the pointer. |
+| `click` | Click by `ref` or by `x`/`y`. Reports `url_changed`, a `hit` chain, and retries. |
+| `dismiss_blocker` | Close the modal intercepting clicks. Prefers a secondary action. |
 | `hover` | Move the mouse without clicking. |
 | `type_text` | Focus a field and type into it. |
 | `assert_changed` | Wait for a page condition and report whether it became true. **How you verify an action worked.** |

@@ -650,8 +650,23 @@ class Session:
         button: str = "left",
         clicks: int = 1,
         settle: bool = True,
+        retry: int = 0,
+        expect_change: bool = True,
     ) -> dict[str, Any]:
-        """Click a referenced element, or a raw viewport point."""
+        """Click a referenced element, or a raw viewport point.
+
+        Two things are reported beyond "the event was dispatched":
+
+        * ``url_before`` / ``url_after`` / ``url_changed`` — the cheapest proof
+          that something happened. Navigation is the one observable effect that
+          cannot be faked by a handler that ignores the click.
+        * ``hit`` — the element chain under the pointer. ``hit.blocked`` means a
+          modal scrim swallowed the click.
+
+        ``retry`` re-attempts the click when neither the URL changed nor the DOM
+        settled into anything new. On the final attempt the page is reloaded
+        first, which clears most stale overlays and frozen tabs.
+        """
         tab = self._require_tab()
 
         if ref is not None:
@@ -671,32 +686,247 @@ class Session:
         else:
             raise HandsError("click needs either 'ref' or both 'x' and 'y'")
 
-        await self._dispatch_click(cx, cy, button, clicks)
-        if settle:
-            await self._settle(quiet_ms=220, max_ms=3500)
+        url_before = await self._safe_url()
+        attempts: list[dict[str, Any]] = []
+        total = max(0, retry) + 1
+        result: dict[str, Any] = {}
 
-        result = {
-            "clicked": True,
-            "target": desc,
-            "x": round(cx, 1),
-            "y": round(cy, 1),
-            "url": await self._safe_url(),
-        }
+        for attempt in range(total):
+            if attempt > 0:
+                # A reload clears stale overlays, frozen tabs and half-applied
+                # navigations. It is the cheapest recovery that does not need
+                # to know why the first click failed.
+                if attempt == total - 1:
+                    with contextlib.suppress(Exception):
+                        await tab.get(url_before)
+                        await self._settle(quiet_ms=300, max_ms=5000)
+                    # Re-resolve the element: the reload replaced the DOM.
+                    if ref is not None and ref in self._targets:
+                        t = self._targets[ref]
+                        cx = t.x + t.width / 2
+                        cy = t.y + t.height / 2
+                await asyncio.sleep(0.4)
 
-        # A click can be accepted by CDP and still land on an overlay. Report
-        # what was actually under the pointer so a caller can tell the
-        # difference between "clicked the button" and "clicked a scrim".
-        hit = await self._hit_at(cx, cy)
-        if hit:
-            result["hit"] = hit
-            if hit.get("blocked"):
+            await self._dispatch_click(cx, cy, button, clicks)
+            if settle:
+                await self._settle(quiet_ms=220, max_ms=3500)
+
+            url_after = await self._safe_url()
+            hit = await self._hit_at(cx, cy) or {}
+            blocked = bool(hit.get("blocked"))
+            changed = url_after != url_before
+
+            attempts.append({
+                "attempt": attempt + 1,
+                "url_after": url_after,
+                "url_changed": changed,
+                "blocked": blocked,
+            })
+
+            result = {
+                "clicked": True,
+                "target": desc,
+                "x": round(cx, 1),
+                "y": round(cy, 1),
+                "url": url_after,
+                "url_before": url_before,
+                "url_after": url_after,
+                "url_changed": changed,
+                "hit": hit,
+            }
+
+            if blocked:
                 result["warning"] = (
                     f"A modal overlay is intercepting clicks: "
                     f"{hit.get('blocker_text', '')[:80]!r}. "
-                    "Dismiss it before interacting with the page."
+                    "Call dismiss_blocker, or pass auto_dismiss=True."
                 )
+                # Retrying a blocked click is pointless: the overlay is still
+                # there. Stop and report rather than burn attempts.
+                break
+
+            if not expect_change or changed:
+                break
+
+        if len(attempts) > 1:
+            result["attempts"] = attempts
+        if not result.get("url_changed") and not result.get("hit", {}).get("blocked"):
+            result.setdefault("note", (
+                "The URL did not change. If the click was meant to navigate, "
+                "verify with assert_changed; if it was meant to mutate the page, "
+                "the handler may have ignored it."
+            ))
 
         return result
+
+    async def dismiss_blocker(self, *, prefer: Sequence[str] | None = None,
+                              dry_run: bool = False) -> dict[str, Any]:
+        """Find and close whatever modal is intercepting the page.
+
+        Google properties (Colab, Gmail, Drive) render dialogs as ``mwc-dialog``
+        with a full-viewport ``mdc-dialog__scrim``. While that scrim is up, every
+        coordinate resolves to it and clicks silently do nothing.
+
+        The buttons are slotted in from the light DOM, not from the dialog's
+        shadow root, so a shadow-only search finds the dialog but no way out.
+        This walks both.
+
+        Args:
+            prefer: Button labels to try first, in order. Defaults to a list of
+                dismissal words across the languages Colab ships.
+            dry_run: Report what would be clicked without clicking.
+
+        Returns the dialog found, the button chosen, and whether it closed.
+        """
+        tab = self._require_tab()
+
+        discover = r"""(() => {
+          const out = [];
+
+          function buttonsIn(scope) {
+            const found = [];
+            const push = (b) => {
+              const r = b.getBoundingClientRect();
+              if (r.width < 8 || r.height < 8) return;
+              found.push({
+                text: (b.innerText || b.textContent || '')
+                  .replace(/\s+/g, ' ').trim().slice(0, 40),
+                slot: b.getAttribute ? b.getAttribute('slot') : null,
+                x: r.left + r.width / 2,
+                y: r.top + r.height / 2,
+              });
+            };
+            try {
+              scope.querySelectorAll(
+                'mwc-button, md-button, md-text-button, md-filled-button, ' +
+                'button, [role="button"]'
+              ).forEach(push);
+            } catch (e) {}
+            if (scope.shadowRoot) {
+              try {
+                scope.shadowRoot.querySelectorAll(
+                  'mwc-button, md-button, md-text-button, md-filled-button, button'
+                ).forEach(push);
+              } catch (e) {}
+            }
+            return found;
+          }
+
+          function visit(root, depth) {
+            if (!root || depth > 30) return;
+            let nodes;
+            try { nodes = root.querySelectorAll('*'); } catch (e) { return; }
+            for (const el of nodes) {
+              const tag = el.tagName ? el.tagName.toLowerCase() : '';
+              const role = el.getAttribute ? el.getAttribute('role') : null;
+              const cls = (el.className || '').toString();
+              const isDialog =
+                tag === 'mwc-dialog' || tag === 'md-dialog' ||
+                tag === 'dialog' || role === 'dialog' ||
+                role === 'alertdialog' || cls.includes('modal-dialog');
+              if (isDialog) {
+                const r = el.getBoundingClientRect();
+                if (r.width >= 40 && r.height >= 40) {
+                  out.push({
+                    tag,
+                    text: (el.innerText || '')
+                      .replace(/\s+/g, ' ').trim().slice(0, 160),
+                    x0: Math.round(r.left), y0: Math.round(r.top),
+                    w: Math.round(r.width), h: Math.round(r.height),
+                    buttons: buttonsIn(el),
+                    inShadow: depth > 0,
+                  });
+                }
+              }
+              if (el.shadowRoot) visit(el.shadowRoot, depth + 1);
+              if (tag === 'iframe' || tag === 'frame') {
+                let doc = null;
+                try { doc = el.contentDocument; } catch (e) { doc = null; }
+                if (doc) visit(doc, depth + 1);
+              }
+            }
+          }
+          visit(document, 0);
+
+          return {
+            dialogs: out,
+            scrims: document.querySelectorAll('.mdc-dialog__scrim').length,
+          };
+        })()"""
+
+        found = await tab.evaluate(discover) or {}
+        dialogs = found.get("dialogs") or []
+
+        if not dialogs:
+            return {
+                "dismissed": False,
+                "reason": "no dialog found",
+                "scrims": found.get("scrims", 0),
+            }
+
+        # The last one in document order is the topmost.
+        dialog = dialogs[-1]
+        buttons = dialog.get("buttons") or []
+
+        if not buttons:
+            return {
+                "dismissed": False,
+                "reason": "dialog has no visible buttons",
+                "dialog": {"tag": dialog.get("tag"),
+                           "text": dialog.get("text", "")[:100]},
+            }
+
+        # Dismissal words across the languages Colab and Google ship.
+        defaults = [
+            "\u95dc\u9589", "\u5173\u95ed", "Close", "close",     # close
+            "\u77e5\u9053\u4e86", "\u77e5\u9053", "Got it", "OK", "Ok", "ok",
+            "\u78ba\u5b9a", "\u786e\u5b9a", "\u7e7c\u7e8c", "\u7ee7\u7eed", "Continue",
+            "\u53d6\u6d88", "Cancel",                              # cancel
+            "\u7a0d\u5f8c\u518d\u8aaa", "\u7a0d\u540e\u518d\u8bf4", "Later", "Not now",
+        ]
+        order = list(prefer or []) + defaults
+
+        chosen = None
+        for word in order:
+            chosen = next((b for b in buttons
+                           if word.lower() in (b.get("text") or "").lower()),
+                          None)
+            if chosen:
+                break
+
+        # Never pick a primary/destructive action when a secondary exists.
+        if chosen is None:
+            chosen = next((b for b in buttons
+                           if (b.get("slot") or "") == "secondaryAction"), None)
+        if chosen is None:
+            chosen = buttons[0]
+
+        if dry_run:
+            return {
+                "dismissed": False,
+                "dry_run": True,
+                "would_click": chosen.get("text"),
+                "dialog": {"tag": dialog.get("tag"),
+                           "text": dialog.get("text", "")[:100]},
+                "buttons": [b.get("text") for b in buttons],
+            }
+
+        await self._dispatch_click(chosen["x"], chosen["y"], "left", 1)
+        await asyncio.sleep(0.8)
+
+        after = await tab.evaluate(discover) or {}
+        remaining = after.get("dialogs") or []
+
+        return {
+            "dismissed": len(remaining) < len(dialogs),
+            "clicked": chosen.get("text"),
+            "dialog": {"tag": dialog.get("tag"),
+                       "text": dialog.get("text", "")[:100]},
+            "buttons_seen": [b.get("text") for b in buttons],
+            "dialogs_before": len(dialogs),
+            "dialogs_after": len(remaining),
+            "scrims_after": after.get("scrims", 0),
+        }
 
     async def _hit_at(self, x: float, y: float) -> dict[str, Any] | None:
         """Report the deepest element at a point and whether a modal covers it.

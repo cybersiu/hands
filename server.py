@@ -236,6 +236,34 @@ async def observe(
 
 
 @mcp.tool()
+async def dismiss_blocker(
+    prefer: list[str] | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Close the modal that is intercepting clicks.
+
+    Call this when ``click`` reports ``hit.blocked``, or when ``observe``
+    returns elements you cannot interact with. Google properties (Colab, Gmail,
+    Drive) and most admin consoles render a full-viewport scrim behind dialogs;
+    while it is up, every coordinate resolves to the scrim.
+
+    The button labels are matched across the languages those apps ship, and a
+    secondary action (Close, Cancel, Later) is preferred over a primary one, so
+    this does not confirm a destructive choice.
+
+    Args:
+        prefer: Button labels to try first, in order. Useful when the dialog
+            offers something specific like "Reconnect".
+        dry_run: Report the dialog and the button that would be clicked,
+            without clicking.
+
+    Returns the dialog text, which button was clicked, and whether the dialog
+    actually closed.
+    """
+    return await _session.dismiss_blocker(prefer=prefer, dry_run=dry_run)
+
+
+@mcp.tool()
 async def click(
     ref: str | None = None,
     x: float | None = None,
@@ -243,6 +271,8 @@ async def click(
     button: str = "left",
     clicks: int = 1,
     settle: bool = True,
+    retry: int = 0,
+    auto_dismiss: bool = False,
 ) -> dict[str, Any]:
     """Click an element or a point.
 
@@ -251,11 +281,16 @@ async def click(
     target is inside a cross-origin iframe that has no discoverable node, or
     when you are clicking a canvas.
 
-    The result includes a ``hit`` report: the element chain actually under the
-    pointer. If a modal dialog intercepts the click, ``hit.blocked`` is true and
-    a ``warning`` explains it. **A successful return does not prove the click
-    reached its target** — check ``hit``, and verify the page changed with
-    ``assert_changed``.
+    Every call reports three proofs of what happened:
+
+    * ``url_changed`` — the cheapest evidence that the click did something.
+    * ``hit`` — the element chain under the pointer. ``hit.blocked`` means a
+      modal scrim swallowed the click.
+    * ``attempts`` — present when ``retry`` was used.
+
+    **A successful return does not prove the click reached its target.** Check
+    ``url_changed`` and ``hit``, and use ``assert_changed`` for anything subtler
+    than navigation.
 
     Args:
         ref: Element reference from ``observe``, such as "e12".
@@ -264,12 +299,31 @@ async def click(
         button: "left", "right" or "middle".
         clicks: 1 for a click, 2 for a double-click.
         settle: Wait for the DOM to settle afterwards.
+        retry: Extra attempts when the URL did not change. The final attempt
+            reloads the page first, which clears stale overlays.
+        auto_dismiss: If a modal intercepted the click, close it and retry once.
 
-    Returns what was clicked and the resulting URL.
+    Returns what was clicked, the URL before and after, the hit report, and any
+    warning.
     """
-    return await _session.click(
+    result = await _session.click(
         ref=ref, x=x, y=y, button=button, clicks=clicks, settle=settle,
+        retry=retry,
     )
+
+    blocked = bool((result.get("hit") or {}).get("blocked"))
+    if blocked and auto_dismiss:
+        dismissed = await _session.dismiss_blocker()
+        result["auto_dismiss"] = dismissed
+        if dismissed.get("dismissed"):
+            retry = await _session.click(
+                ref=ref, x=x, y=y, button=button, clicks=clicks, settle=settle,
+            )
+            result["retry"] = retry
+            result["hit"] = retry.get("hit")
+            result.pop("warning", None)
+
+    return result
 
 
 @mcp.tool()
