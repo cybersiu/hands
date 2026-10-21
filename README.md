@@ -54,7 +54,7 @@ That is why `bench.py` warns before running: it opens its own connection, so it
 only works when nothing else is attached. Plan around the constraint rather than
 fighting it: run one MCP server and drive everything through its tools.
 
-## Two things that will waste your afternoon
+## Three things that will waste your afternoon
 
 Both of these produce a *successful* tool call that did nothing. Learn them
 before debugging anything else.
@@ -123,6 +123,46 @@ assert_changed("document.querySelectorAll('.cell.execution-count').length > 0")
 
 The failure is the useful part: `changed: false` means the action did not take
 effect, and you now know to inspect the page rather than retry blindly.
+
+### The URL you report may be a photograph of the past
+
+`Target.getTargets` returns a snapshot. Storing its `url` on the tab object and
+answering "where are we?" from it looks correct and is wrong from the first
+navigation onwards:
+
+```
+click reported      url = "chrome://newtab/"
+evaluate location.href = "https://grok.com/"
+```
+
+Two values, one moment, no error. Every comparison built on the snapshot —
+`url_changed`, `assert_changed`, the value `navigate` returns — inherits the
+lie. `Page.navigate` makes it worse: it returns when the *request is accepted*,
+before the document commits, so reading `location.href` immediately afterwards
+still sees the old page.
+
+The fixes are small but they have to be made together:
+
+* `url` is read from the document (`location.href`), never from `Target.getTargets`.
+  If it cannot be read the tool says so; it does not substitute a stale value.
+* `navigate` waits for a new document before returning, and checks
+  `errorText` from `Page.navigate` (a DNS failure is not a successful trip).
+* Waiting uses three signals, because none is sufficient. `location.href`
+  changes on navigation but not on reload; `performance.timeOrigin` changes on
+  every new document including a same-URL reload; `history.length` catches
+  pushState routes. `document.readyState !== "loading"` is the completion
+  condition, but only once identity has changed — otherwise a slow page that
+  has not started navigating looks ready.
+
+```python
+navigate("https://example.com/")
+# {"url": "https://example.com/", "title": "Example Domain"}   # live, not a snapshot
+```
+
+CDP events are now queued per session instead of being dropped, so
+`Page.frameNavigated` and `Page.lifecycleEvent` are available through
+`tab.wait_for_event(...)` when polling is not good enough. Browser-scoped
+events (`Target.*`) carry no `sessionId` by design; they are not malformed.
 
 ### The general rule
 

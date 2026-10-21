@@ -136,6 +136,10 @@ class BrowserSocket:
         self._pending: dict[int, asyncio.Future] = {}
         self._reader: asyncio.Task | None = None
         self._closed = False
+        # CDP events have no ``id``; they are routed by session id. ``None`` is
+        # its own bucket because browser-scoped events (Target.*) omit the
+        # session id by design, which is not an error.
+        self._events: dict[Any, asyncio.Queue] = {}
 
     async def connect(self, timeout: float = 10.0) -> None:
         import websockets
@@ -155,6 +159,21 @@ class BrowserSocket:
                     fut = self._pending.pop(mid, None)
                     if fut is not None and not fut.done():
                         fut.set_result(msg)
+                    continue
+
+                # No id: a CDP event. Dropping these (the previous behaviour)
+                # makes Page.frameNavigated and friends unusable, so queue them
+                # per session. A bounded queue keeps a chatty page from growing
+                # without limit; the oldest event is the least useful one.
+                sid = msg.get("sessionId")
+                queue = self._events.get(sid)
+                if queue is None:
+                    queue = asyncio.Queue(maxsize=512)
+                    self._events[sid] = queue
+                if queue.full():
+                    with contextlib.suppress(asyncio.QueueEmpty):
+                        queue.get_nowait()
+                queue.put_nowait(msg)
         except Exception:
             pass
         finally:
@@ -201,6 +220,43 @@ class BrowserSocket:
             )
         return msg.get("result", {})
 
+    async def wait_event(
+        self,
+        method: str,
+        *,
+        session_id: str | None = None,
+        timeout: float = 10.0,
+        predicate: Any = None,
+    ) -> dict[str, Any]:
+        """Wait for one CDP event, discarding others on the same session.
+
+        Events that arrive before this call are already queued, so a fast
+        navigation is not missed simply because the waiter started late.
+        """
+        queue = self._events.get(session_id)
+        if queue is None:
+            queue = asyncio.Queue(maxsize=512)
+            self._events[session_id] = queue
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise AttachError(f"Timed out after {timeout}s waiting for {method}")
+            try:
+                msg = await asyncio.wait_for(queue.get(), timeout=remaining)
+            except asyncio.TimeoutError as exc:
+                raise AttachError(
+                    f"Timed out after {timeout}s waiting for {method}"
+                ) from exc
+            if msg.get("method") != method:
+                continue
+            params = msg.get("params") or {}
+            if predicate is not None and not predicate(params):
+                continue
+            return params
+
     async def close(self) -> None:
         if self._ws is not None:
             with contextlib.suppress(Exception):
@@ -216,6 +272,18 @@ class BrowserSocket:
 # --------------------------------------------------------------------------
 # Tab shim
 # --------------------------------------------------------------------------
+
+#: Document identity plus readiness, read in one round trip. ``timeOrigin`` is
+#: the only cheap signal that distinguishes a same-URL reload from no action at
+#: all, since neither the URL nor the history length changes in that case.
+_NAV_STATE_JS = """(() => ({
+  href: location.href,
+  ready: document.readyState,
+  t0: performance.timeOrigin,
+  hist: history.length,
+  navType: ((performance.getEntriesByType('navigation')[0]) || {}).type || null,
+}))()"""
+
 
 class RawTab:
     """A page target driven through a flat session.
@@ -237,7 +305,18 @@ class RawTab:
 
     @property
     def url(self) -> str:
+        """The URL from the target list — a snapshot, not the live page.
+
+        This value is captured when targets are enumerated and never updates.
+        Use :meth:`live_url` (or read ``location.href``) for anything that has
+        to be true now.
+        """
         return self._info.get("url") or "about:blank"
+
+    async def live_url(self) -> str:
+        """The page's current URL, read from the document itself."""
+        value = await self.evaluate("location.href")
+        return value if isinstance(value, str) else ""
 
     @property
     def title(self) -> str:
@@ -286,10 +365,89 @@ class RawTab:
             raise RuntimeError(desc)
         return result.get("result", {}).get("value")
 
-    async def get(self, url: str) -> "RawTab":
-        await self._socket.send("Page.navigate", {"url": url},
-                                session_id=self.session_id)
+    async def wait_for_event(self, method: str, *, timeout: float = 10.0,
+                             predicate: Any = None) -> dict[str, Any]:
+        """Wait for one event belonging to this tab's session."""
+        return await self._socket.wait_event(
+            method, session_id=self.session_id, timeout=timeout,
+            predicate=predicate,
+        )
+
+    async def get(self, url: str, *, timeout: float = 30.0,
+                  wait: bool = True) -> "RawTab":
+        """Navigate, and by default wait until the new document is ready.
+
+        ``Page.navigate`` only acknowledges that the request was accepted: it
+        returns before the navigation commits, so reading ``location.href``
+        straight afterwards still sees the old page. That is why a snapshot URL
+        and a live URL disagreed. Waiting here means callers never see the
+        intermediate state.
+        """
+        before = await self._nav_state()
+        result = await self._socket.send(
+            "Page.navigate", {"url": url}, session_id=self.session_id,
+            timeout=timeout,
+        )
+        error = result.get("errorText")
+        if error:
+            raise AttachError(f"Page.navigate refused {url}: {error}")
+        if wait:
+            await self._wait_document(before, result.get("loaderId"), timeout)
         return self
+
+    async def _nav_state(self) -> dict[str, Any]:
+        try:
+            state = await self.evaluate(_NAV_STATE_JS)
+        except Exception:
+            return {}
+        return state if isinstance(state, dict) else {}
+
+    async def _wait_document(self, before: dict[str, Any],
+                             loader_id: Any, timeout: float) -> None:
+        """Poll until the document that replaced ``before`` is usable.
+
+        Three signals are needed because none is sufficient alone:
+
+        * ``location.href`` changes for ordinary navigations but not reloads.
+        * ``performance.timeOrigin`` changes on every new document, including a
+          reload of the same URL.
+        * ``history.length`` catches pushState routes that add an entry.
+
+        ``document.readyState`` is the completion condition, but only once one
+        of the identity signals has fired — otherwise a slow page that has not
+        started navigating yet would look "ready".
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        settled = 0
+        last: dict[str, Any] = before
+
+        while loop.time() < deadline:
+            await asyncio.sleep(0.04)
+            state = await self._nav_state()
+            if not state:
+                continue
+            last = state
+
+            moved = (
+                state.get("href") != before.get("href")
+                or state.get("hist") != before.get("hist")
+                or state.get("t0") != before.get("t0")
+            )
+            if moved and state.get("ready") != "loading":
+                settled += 1
+                # Two consecutive ready polls rule out a redirect hop that
+                # looked interactive for a frame.
+                if settled >= 2 or state.get("ready") == "complete":
+                    return
+            else:
+                settled = 0
+
+        raise AttachError(
+            f"Navigation did not settle within {timeout}s "
+            f"(before={before.get('href')!r} now={last.get('href')!r} "
+            f"ready={last.get('ready')!r} loaderId={loader_id!r})"
+        )
 
     async def close(self) -> None:
         with contextlib.suppress(Exception):
@@ -491,6 +649,39 @@ class _BrowserShim:
             raise AttachError(f"No tab at index {index}")
         info = self._pages[index]
         return await open_session(self._socket, info["targetId"], info)
+
+    async def get(self, url: str, **_kwargs: Any) -> RawTab:
+        """Open a new tab and return its live session.
+
+        ``browser.py``'s new_tab expects the launched-browser API, where
+        ``Browser.get`` returns a tab. Attached browsers have to create the
+        target first and then attach to it.
+        """
+        created = await self._socket.send("Target.createTarget", {"url": url})
+        target_id = created.get("targetId")
+        if not target_id:
+            raise AttachError("Target.createTarget returned no targetId")
+        info = {"targetId": target_id, "url": url, "title": "", "type": "page"}
+        self._pages.append(info)
+        self.tabs = [RawTab(self._socket, p["targetId"], "", p)
+                     for p in self._pages]
+        tab = await open_session(self._socket, target_id, info)
+
+        # A new target starts on about:blank and navigates afterwards, so the
+        # URL is not readable for the first few milliseconds.
+        if url.startswith(("http://", "https://")):
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 20.0
+            while loop.time() < deadline:
+                with contextlib.suppress(Exception):
+                    if (await tab.live_url()) not in ("", "about:blank"):
+                        break
+                await asyncio.sleep(0.05)
+        return tab
+
+    @property
+    def main_tab(self) -> RawTab | None:
+        return self.tabs[0] if self.tabs else None
 
     async def refresh(self) -> list[dict[str, Any]]:
         pages = await list_targets(self._socket)

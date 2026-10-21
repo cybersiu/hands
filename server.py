@@ -400,41 +400,9 @@ async def assert_changed(
         assert_changed("document.querySelectorAll('.cell.executed').length > 0")
         assert_changed("document.title", expect="Dashboard")
     """
-    import time as _time
-
-    start = _time.perf_counter()
-    deadline = start + timeout
-    last_value: Any = None
-
-    while _time.perf_counter() < deadline:
-        try:
-            last_value = await _session.evaluate(expression)
-        except Exception as exc:
-            return {"changed": False, "error": str(exc)[:200],
-                    "elapsed": round(_time.perf_counter() - start, 2)}
-
-        if expect is None:
-            if last_value:
-                return {"changed": True, "value": last_value,
-                        "elapsed": round(_time.perf_counter() - start, 2)}
-        else:
-            if str(last_value) == expect:
-                return {"changed": True, "value": last_value,
-                        "elapsed": round(_time.perf_counter() - start, 2)}
-
-        await asyncio.sleep(0.25)
-
-    return {
-        "changed": False,
-        "value": last_value,
-        "expected": expect,
-        "elapsed": round(_time.perf_counter() - start, 2),
-        "hint": (
-            "The condition never became true. Either the action did not take "
-            "effect, or the condition is wrong. Run observe() and check the "
-            "hit report from the last click."
-        ),
-    }
+    return await _session.assert_changed(
+        expression, expect=expect, timeout=timeout,
+    )
 
 
 @mcp.tool()

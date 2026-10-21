@@ -39,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import inspect
 import json
 import os
 import time
@@ -274,25 +275,43 @@ class Session:
                 browser = await uc.start(config)
             except Exception as exc:
                 raise HandsError(
-                    f"Could not launch Chrome: {exc}. "
-                    "Pass 'executable' with the full path to chrome.exe."
+                    f"Could not launch Chrome: {exc}\n"
+                    f"Profile: {profile}\n"
+                    "If your own Chrome is open, close it or pass a different "
+                    "profile_dir. To drive the running Chrome instead, use "
+                    "attach() rather than start()."
                 ) from exc
 
             self._browser = browser
             tab = browser.main_tab or await browser.get("about:blank")
             self._tab = tab
 
+            # Confirm Chrome honoured the profile, rather than silently using
+            # the default one and colliding with the user's own browser.
+            actual = await self._launched_profile(tab)
+            if actual and "mcp-hands" not in actual.replace("\\", "/"):
+                self._profile_warning = (
+                    f"Chrome launched with {actual!r}, not {str(profile)!r}. "
+                    "The profile argument was not honoured."
+                )
+            else:
+                self._profile_warning = None
+
             await self._apply_viewport(width, height)
             if url and url != "about:blank":
                 await self.navigate(url)
 
-            return {
+            result = {
                 "already_running": False,
                 "url": await self._safe_url(),
                 "headless": headless,
                 "profile": str(profile),
                 "viewport": {"width": width, "height": height},
             }
+            warning = getattr(self, "_profile_warning", None)
+            if warning:
+                result["warning"] = warning
+            return result
 
     async def stop(self) -> dict[str, Any]:
         async with self._lock:
@@ -306,6 +325,21 @@ class Session:
                 if asyncio.iscoroutine(result):
                     await result
             return {"stopped": True}
+
+    async def _launched_profile(self, tab: uc.Tab) -> str | None:
+        """Read the profile directory Chrome actually used.
+
+        Chrome exposes it through the browser process command line. Reading it
+        back is the only way to tell whether ``--user-data-dir`` was honoured.
+        """
+        try:
+            info = await tab.send(cdp.browser.get_browser_command_line())
+            for arg in info:
+                if arg.startswith("--user-data-dir="):
+                    return arg.split("=", 1)[1]
+        except Exception:
+            pass
+        return None
 
     async def _apply_viewport(self, width: int, height: int) -> None:
         tab = self._tab
@@ -323,10 +357,19 @@ class Session:
         return self._tab
 
     async def _safe_url(self) -> str:
+        """The tab's live URL, read from the document.
+
+        The target snapshot that ``Target.getTargets`` returns never updates,
+        so using it here silently corrupted every URL comparison: a click
+        reported ``chrome://newtab/`` while the page was on grok.com. An
+        unreadable URL now returns an empty string rather than a
+        plausible-looking stale one, so failures are visible instead of wrong.
+        """
         try:
-            return self._require_tab().url or "about:blank"
+            value = await self._require_tab().evaluate("location.href")
         except Exception:
-            return "about:blank"
+            return ""
+        return value if isinstance(value, str) else ""
 
     # -- navigation --------------------------------------------------------
 
@@ -335,13 +378,33 @@ class Session:
         tab = self._require_tab()
         if "://" not in url and not url.startswith("about:"):
             url = "https://" + url
+
+        # A launched browser's Tab.get has no timeout parameter; the attached
+        # transport's does, and it waits for the navigation to commit.
         try:
-            await asyncio.wait_for(tab.get(url), timeout=timeout)
+            accepts_timeout = "timeout" in inspect.signature(tab.get).parameters
+        except (TypeError, ValueError):
+            accepts_timeout = False
+
+        try:
+            if accepts_timeout:
+                await asyncio.wait_for(tab.get(url, timeout=timeout),
+                                       timeout=timeout + 10)
+            else:
+                await asyncio.wait_for(tab.get(url), timeout=timeout + 10)
         except asyncio.TimeoutError as exc:
             raise HandsError(f"Navigation to {url} timed out after {timeout}s") from exc
+
         if settle:
             await self._settle()
-        return {"url": await self._safe_url(), "title": await self.title()}
+
+        live = await self._safe_url()
+        if not live:
+            raise HandsError(
+                f"Navigation to {url} finished but location.href could not be "
+                "read; refusing to report the target snapshot as the URL."
+            )
+        return {"url": live, "title": await self.title()}
 
     async def title(self) -> str:
         tab = self._require_tab()
@@ -455,19 +518,25 @@ class Session:
                             targets: list[Target]) -> None:
         """Re-read element labels through Runtime.evaluate.
 
-        ``DOM.getDocument`` carries text as ``node_value`` strings, and on some
-        Windows transports those arrive as ``?`` for non-ASCII characters. A
-        label of "全部執行" comes back as "? ? ? ?", which makes every
-        text-based match useless.
+        Why this exists
+        ---------------
+        ``DOM.getDocument`` returns element text as ``node_value`` strings, and
+        those arrive as ``?`` for non-ASCII on some Windows transports. A label
+        of "全部執行" comes back as "? ? ? ?", which makes every text-based
+        match useless. ``innerText`` read through ``Runtime.evaluate`` travels
+        as a JSON string and survives intact.
 
-        ``innerText`` read through ``Runtime.evaluate`` travels as a JSON string
-        and survives intact, so the damaged labels are re-read from the live DOM
-        in one pass and matched back by document order.
+        Why it matches by id, not position
+        ----------------------------------
+        The CDP walk and a JavaScript walk do not visit the same set of nodes:
+        the CDP side filters on tag, role and attributes while descending, and
+        a naive ``querySelectorAll('*')`` sees three times as many. Index N in
+        one list is therefore not index N in the other. Each target carries its
+        backend node id, so the JS side resolves exactly those ids instead.
         """
         if not targets:
             return
 
-        # ASCII-only labels are already trustworthy; only repair the rest.
         damaged = [t for t in targets
                    if not (t.text or "").strip()
                    or "?" in (t.text or "")
@@ -475,62 +544,49 @@ class Session:
         if not damaged:
             return
 
-        reader = r"""
-        (() => {
-          const TAGS = %(tags)s;
-          const ROLES = %(roles)s;
-          const out = [];
+        # `DOM.resolveNode` accepts a backend node id directly, so each damaged
+        # element becomes a RemoteObject and `Runtime.callFunctionOn` reads its
+        # innerText. That path is what decodes CJK correctly; the CDP node tree
+        # does not.
+        resolved: dict[int, str] = {}
+        read_js = (
+            "function() {"
+            "  const t = this.innerText || this.textContent || '';"
+            "  return t.replace(/\\s+/g, ' ').trim().slice(0, 120);"
+            "}"
+        )
 
-          function visit(root, depth) {
-            if (!root || depth > 30) return;
-            let nodes;
-            try { nodes = root.querySelectorAll('*'); } catch (e) { return; }
-            for (const el of nodes) {
-              const tag = el.tagName ? el.tagName.toLowerCase() : '';
-              const role = el.getAttribute ? el.getAttribute('role') : null;
-              const interesting =
-                TAGS.includes(tag) ||
-                (role && ROLES.includes(role.toLowerCase())) ||
-                (el.hasAttribute && (
-                  el.hasAttribute('onclick') ||
-                  el.hasAttribute('tabindex') ||
-                  el.getAttribute('contenteditable') === 'true'
-                ));
-              if (interesting) {
-                const raw = el.innerText || el.textContent || '';
-                out.push(raw.replace(/\s+/g, ' ').trim().slice(0, 120));
-              }
-              if (el.shadowRoot) visit(el.shadowRoot, depth + 1);
-              if (tag === 'iframe' || tag === 'frame') {
-                let doc = null;
-                try { doc = el.contentDocument; } catch (e) { doc = null; }
-                if (doc) visit(doc, depth + 1);
-              }
-            }
-          }
-          visit(document, 0);
-          return out;
-        })()
-        """
+        for target in damaged:
+            backend_id = target.backend_node_id
+            if not backend_id:
+                continue
+            key = int(backend_id)
+            if key in resolved:
+                target.text = resolved[key]
+                continue
+            try:
+                remote = await tab.send(cdp.dom.resolve_node(
+                    backend_node_id=backend_id
+                ))
+                object_id = getattr(remote, "object_id", None)
+                if object_id is None:
+                    object_id = getattr(remote, "objectId", None)
+                if not object_id:
+                    continue
 
-        tags_js = "[" + ",".join(f'"{t}"' for t in sorted(INTERACTIVE_TAGS)) + "]"
-        roles_js = "[" + ",".join(f'"{r}"' for r in sorted(INTERACTIVE_ROLES)) + "]"
-
-        try:
-            texts = await tab.evaluate(reader % {"tags": tags_js,
-                                                 "roles": roles_js})
-        except Exception:
-            return
-
-        # The JS walk and the CDP walk visit the same tree in the same order, so
-        # positions line up. A length mismatch means something moved; leave the
-        # CDP text in place rather than mislabelling elements.
-        if not isinstance(texts, list) or len(texts) != len(targets):
-            return
-
-        for target, fixed in zip(targets, texts):
-            if isinstance(fixed, str) and fixed.strip():
-                target.text = fixed
+                result = await tab.send(cdp.runtime.call_function_on(
+                    function_declaration=read_js,
+                    object_id=object_id,
+                    return_by_value=True,
+                ))
+                # call_function_on returns (RemoteObject, ExceptionDetails|None)
+                value = result[0] if isinstance(result, tuple) else result
+                text = getattr(value, "value", None)
+                if isinstance(text, str) and text.strip():
+                    resolved[key] = text
+                    target.text = text
+            except Exception:
+                continue
 
     def _classify(self, node: Any, frame_id: str,
                   shadow_depth: int) -> Target | None:
@@ -577,38 +633,101 @@ class Session:
     async def _rect_for(self, node: Any, tab: uc.Tab,
                         include_offscreen: bool,
                         min_size: int) -> tuple[float, float, float, float] | None:
-        """Resolve a node's viewport rectangle via its content quads."""
+        """Resolve a node's viewport rectangle.
+
+        ``DOM.getContentQuads`` is the precise route, but it returns nothing for
+        elements in a sticky or fixed container — which is where most sites put
+        their search box. When that happens the rectangle is read from the live
+        DOM through ``Runtime.evaluate`` instead.
+
+        Both routes return CSS pixels relative to the top-level viewport, so
+        callers cannot tell which one answered.
+        """
         backend_id = _backend_id(node)
         if not backend_id:
             return None
+
+        rect = None
         try:
-            quads = await tab.send(cdp.dom.get_content_quads(backend_node_id=backend_id))
+            quads = await tab.send(cdp.dom.get_content_quads(
+                backend_node_id=backend_id))
         except Exception:
-            return None
-        if not quads:
+            quads = None
+
+        if quads:
+            # An element split across lines yields several quads; use their
+            # union so the rectangle covers the whole thing.
+            left = top = float("inf")
+            right = bottom = float("-inf")
+            for quad in quads:
+                x, y, w, h = _quad_to_rect(list(quad))
+                left = min(left, x)
+                top = min(top, y)
+                right = max(right, x + w)
+                bottom = max(bottom, y + h)
+            rect = (left, top, right - left, bottom - top)
+
+        if rect is None:
+            rect = await self._rect_from_dom(tab, backend_id)
+
+        if rect is None:
             return None
 
-        # An element split across lines yields several quads; use their union.
-        left = top = float("inf")
-        right = bottom = float("-inf")
-        for quad in quads:
-            x, y, w, h = _quad_to_rect(list(quad))
-            left = min(left, x)
-            top = min(top, y)
-            right = max(right, x + w)
-            bottom = max(bottom, y + h)
-
-        width, height = right - left, bottom - top
+        left, top, width, height = rect
         if width < min_size and height < min_size:
             return None
 
         if not include_offscreen:
             info = await self._viewport_info()
-            if bottom < 0 or right < 0:
+            if top + height < 0 or left + width < 0:
                 return None
             if top > info["innerHeight"] * 3 or left > info["innerWidth"] * 3:
                 return None
 
+        return left, top, width, height
+
+    async def _rect_from_dom(self, tab: uc.Tab, backend_id: Any
+                             ) -> tuple[float, float, float, float] | None:
+        """Read an element's bounding rectangle through the page.
+
+        ``DOM.resolveNode`` turns the backend id into a JavaScript handle, then
+        ``getBoundingClientRect`` reports the geometry the renderer actually
+        uses — including sticky and fixed positioning, which the quads API
+        sometimes declines to describe.
+        """
+        try:
+            remote = await tab.send(cdp.dom.resolve_node(
+                backend_node_id=backend_id))
+        except Exception:
+            return None
+
+        object_id = (getattr(remote, "object_id", None)
+                     or getattr(remote, "objectId", None))
+        if not object_id:
+            return None
+
+        js = (
+            "function() {"
+            "  const r = this.getBoundingClientRect();"
+            "  return [r.left, r.top, r.width, r.height];"
+            "}"
+        )
+        try:
+            result = await tab.send(cdp.runtime.call_function_on(
+                function_declaration=js,
+                object_id=object_id,
+                return_by_value=True,
+            ))
+        except Exception:
+            return None
+
+        value = result[0] if isinstance(result, tuple) else result
+        coords = getattr(value, "value", None)
+        if (not isinstance(coords, list) or len(coords) != 4
+                or not all(isinstance(c, (int, float)) for c in coords)):
+            return None
+
+        left, top, width, height = (float(c) for c in coords)
         return left, top, width, height
 
     async def _top_frame_id(self, tab: uc.Tab) -> str:
@@ -782,6 +901,7 @@ class Session:
 
         discover = r"""(() => {
           const out = [];
+          const seen = new Set();
 
           function buttonsIn(scope) {
             const found = [];
@@ -812,33 +932,57 @@ class Session:
             return found;
           }
 
+          // A dialog may be a custom element whose shadow root contains the
+          // actual role="dialog" node. Walk up to the outermost custom element
+          // so slotted light-DOM buttons are included.
+          function hostOf(el) {
+            let cur = el;
+            let outer = el;
+            while (cur) {
+              if (cur.tagName && cur.tagName.includes('-')) outer = cur;
+              cur = cur.parentElement || (cur.getRootNode && cur.getRootNode().host);
+            }
+            return outer;
+          }
+
+          function consider(el, depth) {
+            const tag = el.tagName ? el.tagName.toLowerCase() : '';
+            const role = el.getAttribute ? el.getAttribute('role') : null;
+            const cls = (el.className || '').toString();
+            const looksLikeDialog =
+              tag === 'mwc-dialog' || tag === 'md-dialog' ||
+              tag === 'dialog' || role === 'dialog' ||
+              role === 'alertdialog' || cls.includes('modal-dialog');
+
+            if (!looksLikeDialog) return;
+
+            const host = hostOf(el);
+            if (seen.has(host)) return;
+            seen.add(host);
+
+            const r = host.getBoundingClientRect();
+            const text = (host.innerText || '')
+              .replace(/\s+/g, ' ').trim().slice(0, 200);
+            if (!text && r.width < 40) return;
+
+            out.push({
+              tag: host.tagName.toLowerCase(),
+              text,
+              x0: Math.round(r.left), y0: Math.round(r.top),
+              w: Math.round(r.width), h: Math.round(r.height),
+              buttons: buttonsIn(host),
+              inShadow: depth > 0,
+            });
+          }
+
           function visit(root, depth) {
             if (!root || depth > 30) return;
             let nodes;
             try { nodes = root.querySelectorAll('*'); } catch (e) { return; }
             for (const el of nodes) {
-              const tag = el.tagName ? el.tagName.toLowerCase() : '';
-              const role = el.getAttribute ? el.getAttribute('role') : null;
-              const cls = (el.className || '').toString();
-              const isDialog =
-                tag === 'mwc-dialog' || tag === 'md-dialog' ||
-                tag === 'dialog' || role === 'dialog' ||
-                role === 'alertdialog' || cls.includes('modal-dialog');
-              if (isDialog) {
-                const r = el.getBoundingClientRect();
-                if (r.width >= 40 && r.height >= 40) {
-                  out.push({
-                    tag,
-                    text: (el.innerText || '')
-                      .replace(/\s+/g, ' ').trim().slice(0, 160),
-                    x0: Math.round(r.left), y0: Math.round(r.top),
-                    w: Math.round(r.width), h: Math.round(r.height),
-                    buttons: buttonsIn(el),
-                    inShadow: depth > 0,
-                  });
-                }
-              }
+              consider(el, depth);
               if (el.shadowRoot) visit(el.shadowRoot, depth + 1);
+              const tag = el.tagName ? el.tagName.toLowerCase() : '';
               if (tag === 'iframe' || tag === 'frame') {
                 let doc = null;
                 try { doc = el.contentDocument; } catch (e) { doc = null; }
@@ -864,8 +1008,11 @@ class Session:
                 "scrims": found.get("scrims", 0),
             }
 
-        # The last one in document order is the topmost.
-        dialog = dialogs[-1]
+        # Prefer a dialog that actually exposes buttons; a nested role="dialog"
+        # inside a custom element often has none of its own.
+        with_buttons = [d for d in dialogs if d.get("buttons")]
+        pool = with_buttons or dialogs
+        dialog = pool[-1]
         buttons = dialog.get("buttons") or []
 
         if not buttons:
@@ -946,11 +1093,26 @@ class Session:
           let guard = 0;
           while (el && guard++ < 20) {
             const tag = el.tagName ? el.tagName.toLowerCase() : '?';
+            // innerText is empty on a custom element whose content lives in a
+            // shadow root, so fall back to the shadow root's text.
+            let text = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+            if (!text && el.shadowRoot) {
+              text = (el.shadowRoot.textContent || '')
+                .replace(/\\s+/g, ' ').trim();
+            }
+            const r = el.getBoundingClientRect();
+            // How much of the viewport this element covers. A dialog scrim
+            // covers nearly all of it; a toolbar button covers almost none.
+            const coverage =
+              (r.width * r.height) /
+              Math.max(1, window.innerWidth * window.innerHeight);
+
             chain.push({
               tag,
               id: el.id || null,
               cls: (el.className || '').toString().slice(0, 40),
-              text: (el.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 80),
+              text: text.slice(0, 120),
+              coverage: Math.round(coverage * 100) / 100,
             });
             if (!el.shadowRoot) break;
             const inner = el.shadowRoot.elementFromPoint(X, Y);
@@ -958,8 +1120,15 @@ class Session:
             el = inner;
           }
           const modal = chain.find(c =>
-            c.tag === 'mwc-dialog' || c.tag === 'md-dialog' ||
-            c.cls.includes('mdc-dialog') || c.cls.includes('scrim')
+            (c.tag === 'mwc-dialog' || c.tag === 'md-dialog' ||
+             c.tag === 'dialog' ||
+             c.cls.includes('scrim') ||
+             c.cls.includes('modal-dialog')) &&
+            // A real blocker covers a large part of the viewport. Without this
+            // check, an ordinary md-outlined-button whose class happens to
+            // contain "dialog" is reported as a blocker, which is a false
+            // positive that makes every successful click look intercepted.
+            (c.coverage || 0) >= 0.5
           );
           return {
             chain,
@@ -975,6 +1144,67 @@ class Session:
             return value if isinstance(value, dict) else None
         except Exception:
             return None
+
+    # -- verification ------------------------------------------------------
+
+    async def assert_changed(
+        self,
+        expression: str,
+        expect: str | None = None,
+        timeout: float = 5.0,
+        interval: float = 0.25,
+    ) -> dict[str, Any]:
+        """Poll a page expression until it matches, and report what happened.
+
+        This is the only reliable way to know an action took effect. A click
+        can be dispatched, accepted, and ignored by the page; only observable
+        state settles the question.
+
+        Args:
+            expression: JavaScript whose value is checked.
+            expect: If given, satisfied when the value's text equals this.
+                If omitted, any truthy value satisfies it.
+            timeout: Seconds to keep polling.
+            interval: Seconds between polls.
+
+        Returns ``changed``, the last value, and elapsed time.
+        """
+        import time as _time
+
+        start = _time.perf_counter()
+        deadline = start + timeout
+        last: Any = None
+
+        while _time.perf_counter() < deadline:
+            try:
+                last = await self.evaluate(expression)
+            except Exception as exc:
+                return {
+                    "changed": False,
+                    "error": str(exc)[:200],
+                    "elapsed": round(_time.perf_counter() - start, 2),
+                }
+
+            satisfied = (str(last) == expect) if expect is not None else bool(last)
+            if satisfied:
+                return {
+                    "changed": True,
+                    "value": last,
+                    "elapsed": round(_time.perf_counter() - start, 2),
+                }
+            await asyncio.sleep(interval)
+
+        return {
+            "changed": False,
+            "value": last,
+            "expected": expect,
+            "elapsed": round(_time.perf_counter() - start, 2),
+            "hint": (
+                "The condition never became true. Either the action did not "
+                "take effect, or the condition is wrong. Run observe() and "
+                "check the hit report from the last click."
+            ),
+        }
 
     async def _scroll_into_view(self, target: Target, tab: uc.Tab) -> None:
         """Bring the element on screen; off-screen clicks miss silently."""
@@ -1061,17 +1291,24 @@ class Session:
             if target is None:
                 raise HandsError(f"Unknown ref {ref!r}. Call 'observe' again.")
             await self._scroll_into_view(target, tab)
-            await self._dispatch_click(
-                target.x + target.width / 2,
-                target.y + target.height / 2,
-                "left", 1,
-            )
+            cx = target.x + target.width / 2
+            cy = target.y + target.height / 2
         elif x is not None and y is not None:
-            await self._dispatch_click(float(x), float(y), "left", 1)
+            cx, cy = float(x), float(y)
         else:
             raise HandsError("type_text needs 'ref' or 'x'/'y' to focus a field")
 
-        await asyncio.sleep(0.06)
+        # A CDP mouse event at the right coordinates does not always focus an
+        # input: the page may move the element on mousedown, or a wrapper may
+        # swallow the press. Verify focus and fall back to element.focus(),
+        # which is what a user's click would have achieved.
+        await self._dispatch_click(cx, cy, "left", 1)
+        await asyncio.sleep(0.08)
+
+        focused = await self._focus_verify(tab, ref, cx, cy)
+        if not focused:
+            await self._focus_at(tab, ref, cx, cy)
+            await asyncio.sleep(0.05)
 
         if clear:
             await self.press("ctrl+a", settle=False)
@@ -1090,12 +1327,76 @@ class Session:
             await asyncio.sleep(0.05)
             await self.press("Enter")
 
+        active = await self._active_element()
         return {
             "typed": len(text),
             "submitted": submit,
-            "active": await self._active_element(),
+            "active": active,
             "url": await self._safe_url(),
         }
+
+    async def _focus_verify(self, tab: uc.Tab, ref: str | None,
+                            x: float, y: float) -> bool:
+        """Is a text-entry element focused at the click point?
+
+        A point inside an iframe reports the frame element as the active
+        element, and the inner document is not reachable from here. That counts
+        as success: the click was dispatched into the frame, so refusing it
+        would send the caller into the fallback, which can only steal focus
+        back out of the frame and break typing.
+        """
+        js = """(() => {
+          const a = document.activeElement;
+          if (!a) return false;
+          const t = (a.tagName || '').toLowerCase();
+          if (t === 'iframe' || t === 'frame') return true;
+          if (t === 'textarea') return true;
+          if (t === 'input') {
+            const kind = (a.getAttribute('type') || 'text').toLowerCase();
+            return !['checkbox','radio','hidden','submit','button',
+                     'file','range','color'].includes(kind);
+          }
+          return a.getAttribute && a.getAttribute('contenteditable') === 'true';
+        })()"""
+        with contextlib.suppress(Exception):
+            return bool(await tab.evaluate(js))
+        return False
+
+    async def _focus_at(self, tab: uc.Tab, ref: str | None,
+                        x: float, y: float) -> None:
+        """Focus the element at a point through the DOM.
+
+        This is the fallback when the synthetic mouse press did not focus the
+        field. It targets whatever is actually at the coordinates, so it works
+        even when the resolved ref has moved.
+        """
+        js = """(() => {
+          const el = document.elementFromPoint(%(x)d, %(y)d);
+          if (!el) return false;
+          // Never focus an iframe element: it moves focus out of the frame the
+          // click already landed in, and the inner field cannot be re-focused
+          // from this document.
+          if ((el.tagName || '').toLowerCase() === 'iframe') return false;
+          let target = el;
+          // If the point landed on a child, climb to the field.
+          while (target && target !== document.body) {
+            const t = (target.tagName || '').toLowerCase();
+            if (t === 'input' || t === 'textarea' ||
+                (target.getAttribute &&
+                 target.getAttribute('contenteditable') === 'true')) {
+              target.focus();
+              if (t === 'input' || t === 'textarea') {
+                target.select && target.select();
+              }
+              return true;
+            }
+            target = target.parentElement;
+          }
+          if (el.focus) { el.focus(); return true; }
+          return false;
+        })()""" % {"x": int(x), "y": int(y)}
+        with contextlib.suppress(Exception):
+            await tab.evaluate(js)
 
     async def _active_element(self) -> dict[str, Any] | None:
         tab = self._tab
@@ -1246,7 +1547,8 @@ class Session:
         self._targets.clear()
         with contextlib.suppress(Exception):
             await tab.bring_to_front()
-        return {"index": index, "url": tab.url, "title": tab.title}
+        return {"index": index, "url": await self._safe_url(),
+                "title": await self.title()}
 
     async def new_tab(self, url: str = "about:blank") -> dict[str, Any]:
         browser = self._browser
@@ -1255,7 +1557,7 @@ class Session:
         tab = await browser.get(url)
         self._tab = tab
         self._targets.clear()
-        return {"url": tab.url, "tabs": len(browser.tabs)}
+        return {"url": await self._safe_url(), "tabs": len(browser.tabs)}
 
     async def close_tab(self, index: int | None = None) -> dict[str, Any]:
         browser = self._browser

@@ -12,6 +12,9 @@ env/
 _probe.mjs
 _diag.mjs
 _repro.mjs
+_diag_*.py
+_probe_*.py
+_check_*.py
 
 # Local profiles and screenshots
 profile/
