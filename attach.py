@@ -1,0 +1,499 @@
+"""
+attach.py — Attach to a running Chrome over its DevTools WebSocket.
+
+How Chrome 144+ remote debugging actually works
+-----------------------------------------------
+Enabling remote debugging at ``chrome://inspect/#remote-debugging`` and
+approving a connection makes Chrome write ``DevToolsActivePort`` into its
+user-data directory:
+
+    line 1: 9222
+    line 2: /devtools/browser/85038e3e-...
+
+Three facts follow, and each one breaks a common assumption:
+
+1. **HTTP 404s.** ``/json/version``, ``/json/list`` and ``/`` all return 404.
+   The port is not a normal debug port; it speaks only the approval protocol.
+   Anything that discovers browsers over HTTP (including zendriver's
+   ``Browser.create``) fails here.
+
+2. **The browser WebSocket works.** Line 2 is a live CDP endpoint. Opening it
+   and sending ``Browser.getVersion`` returns the Chrome version.
+
+3. **Page WebSockets are refused.** ``/devtools/page/<id>`` returns HTTP 403.
+   Per-page sockets are disabled in approval mode. Everything must go through
+   the *browser* socket using **flat sessions**:
+   ``Target.attachToTarget {flatten: true}`` yields a session id, and every
+   subsequent command carries that ``sessionId`` on the same socket.
+
+This module implements (3) directly, so no Puppeteer is needed. It exposes a
+``RawTab`` whose ``send()`` mirrors zendriver's ``Tab.send()`` signature, which
+means ``browser.py``'s observe/click/type code runs unchanged against either a
+launched browser or an attached one.
+
+Usage
+-----
+    session = Session()
+    await attach(session)                       # default Chrome profile
+    await attach(session, user_data_dir=...)    # explicit profile
+    await attach(session, ws_url=...)           # explicit endpoint
+    await attach(session, tab_index=1)          # pick a specific tab
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any, Generator
+
+# --------------------------------------------------------------------------
+# Errors
+# --------------------------------------------------------------------------
+
+class AttachError(RuntimeError):
+    """The running Chrome could not be attached to, with an actionable reason."""
+
+
+# --------------------------------------------------------------------------
+# Locating the endpoint
+# --------------------------------------------------------------------------
+
+def chrome_user_data_root() -> Path:
+    """Default Chrome user-data directory for this platform."""
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")
+        return Path(base) / "Google" / "Chrome" / "User Data"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
+    return Path.home() / ".config" / "google-chrome"
+
+
+def read_devtools_port(user_data_dir: Path | str | None = None) -> tuple[int, str]:
+    """Parse ``DevToolsActivePort`` into ``(port, ws_path)``."""
+    root = Path(user_data_dir).expanduser() if user_data_dir else chrome_user_data_root()
+    port_file = root / "DevToolsActivePort"
+
+    if not port_file.exists():
+        raise AttachError(
+            f"No DevToolsActivePort in {root}.\n"
+            "Open Chrome, go to chrome://inspect/#remote-debugging, enable "
+            "remote debugging, then approve the incoming connection."
+        )
+
+    try:
+        raw = port_file.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise AttachError(f"Cannot read {port_file}: {exc}") from exc
+
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        raise AttachError(
+            f"{port_file} is incomplete: expected a port and a WebSocket path, "
+            f"found {len(lines)} non-empty line(s). Re-approve in Chrome."
+        )
+
+    port_text, ws_path = lines[0], lines[1]
+    try:
+        port = int(port_text, 10)
+    except ValueError as exc:
+        raise AttachError(f"Invalid port {port_text!r} in {port_file}") from exc
+    if not (0 < port <= 65535):
+        raise AttachError(f"Port {port} is out of range in {port_file}")
+    if not ws_path.startswith("/devtools/"):
+        raise AttachError(
+            f"Unexpected path {ws_path!r} in {port_file}; "
+            "expected something like /devtools/browser/<uuid>"
+        )
+
+    return port, ws_path
+
+
+def ws_endpoint(user_data_dir: Path | str | None = None) -> str:
+    """Full WebSocket URL for the running Chrome."""
+    port, path = read_devtools_port(user_data_dir)
+    return f"ws://127.0.0.1:{port}{path}"
+
+
+# --------------------------------------------------------------------------
+# Flat-session CDP transport
+# --------------------------------------------------------------------------
+
+class BrowserSocket:
+    """One WebSocket to Chrome, multiplexing many flat sessions.
+
+    Chrome's approval mode refuses per-page sockets, so every command travels
+    on this single connection with a ``sessionId`` field selecting the page.
+    """
+
+    def __init__(self, url: str) -> None:
+        self.url = url
+        self._ws: Any = None
+        self._id = 0
+        self._pending: dict[int, asyncio.Future] = {}
+        self._reader: asyncio.Task | None = None
+        self._closed = False
+
+    async def connect(self, timeout: float = 10.0) -> None:
+        import websockets
+        self._ws = await websockets.connect(self.url, max_size=2 ** 26,
+                                            open_timeout=timeout)
+        self._reader = asyncio.create_task(self._read_loop())
+
+    async def _read_loop(self) -> None:
+        try:
+            async for raw in self._ws:
+                try:
+                    msg = json.loads(raw)
+                except Exception:
+                    continue
+                mid = msg.get("id")
+                if mid is not None:
+                    fut = self._pending.pop(mid, None)
+                    if fut is not None and not fut.done():
+                        fut.set_result(msg)
+        except Exception:
+            pass
+        finally:
+            self._closed = True
+            for fut in self._pending.values():
+                if not fut.done():
+                    fut.set_exception(AttachError("Chrome closed the connection"))
+            self._pending.clear()
+
+    async def send(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        *,
+        session_id: str | None = None,
+        timeout: float = 30.0,
+    ) -> dict[str, Any]:
+        """Send one CDP command and await its result."""
+        if self._ws is None or self._closed:
+            raise AttachError("The CDP connection is not open.")
+
+        self._id += 1
+        mid = self._id
+        payload: dict[str, Any] = {"id": mid, "method": method}
+        if params:
+            payload["params"] = params
+        if session_id:
+            payload["sessionId"] = session_id
+
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._pending[mid] = fut
+        await self._ws.send(json.dumps(payload))
+
+        try:
+            msg = await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            self._pending.pop(mid, None)
+            raise AttachError(f"{method} timed out after {timeout}s") from exc
+
+        if "error" in msg:
+            err = msg["error"]
+            raise RuntimeError(
+                f"{method}: {err.get('message', err)} (code {err.get('code')})"
+            )
+        return msg.get("result", {})
+
+    async def close(self) -> None:
+        if self._ws is not None:
+            with contextlib.suppress(Exception):
+                await self._ws.close()
+        self._closed = True
+        if self._reader is not None:
+            self._reader.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._reader
+            self._reader = None
+
+
+# --------------------------------------------------------------------------
+# Tab shim
+# --------------------------------------------------------------------------
+
+class RawTab:
+    """A page target driven through a flat session.
+
+    ``send()`` accepts zendriver CDP generator objects, exactly like
+    ``zendriver.core.tab.Tab.send``, so ``browser.py`` does not need to know
+    which transport it is talking to.
+    """
+
+    def __init__(self, socket: BrowserSocket, target_id: str,
+                 session_id: str, info: dict[str, Any]) -> None:
+        self._socket = socket
+        self.target_id = target_id
+        self.session_id = session_id
+        self._info = info
+        self.connection = socket  # duck-type: browser.py touches this rarely
+
+    # -- metadata ----------------------------------------------------------
+
+    @property
+    def url(self) -> str:
+        return self._info.get("url") or "about:blank"
+
+    @property
+    def title(self) -> str:
+        return self._info.get("title") or ""
+
+    @property
+    def target(self) -> Any:
+        return self._info
+
+    # -- CDP ---------------------------------------------------------------
+
+    async def send(self, cdp_obj: Generator[dict, dict, Any], *,
+                   timeout: float = 30.0) -> Any:
+        """Run a zendriver CDP generator and return its typed result.
+
+        The generator expects to be *sent* the reply dict and then returns the
+        coerced value via ``StopIteration.value``. Driving it that way gives the
+        same ``cdp.dom.Node`` objects a launched browser produces.
+        """
+        method, params = _request(cdp_obj)
+        raw = await self._socket.send(method, params,
+                                      session_id=self.session_id,
+                                      timeout=timeout)
+        try:
+            cdp_obj.send(raw)
+        except StopIteration as stop:
+            return stop.value
+        except Exception:
+            return raw
+        return raw
+
+    async def evaluate(self, expression: str, await_promise: bool = False,
+                       return_by_value: bool = True) -> Any:
+        result = await self._socket.send(
+            "Runtime.evaluate",
+            {
+                "expression": expression,
+                "returnByValue": return_by_value,
+                "awaitPromise": await_promise,
+                "userGesture": True,
+            },
+            session_id=self.session_id,
+        )
+        if "exceptionDetails" in result:
+            desc = result["exceptionDetails"].get("text", "evaluate failed")
+            raise RuntimeError(desc)
+        return result.get("result", {}).get("value")
+
+    async def get(self, url: str) -> "RawTab":
+        await self._socket.send("Page.navigate", {"url": url},
+                                session_id=self.session_id)
+        return self
+
+    async def close(self) -> None:
+        with contextlib.suppress(Exception):
+            await self._socket.send("Target.closeTarget",
+                                    {"targetId": self.target_id})
+
+    async def bring_to_front(self) -> None:
+        with contextlib.suppress(Exception):
+            await self._socket.send("Page.bringToFront", {},
+                                    session_id=self.session_id)
+
+
+def _request(cdp_obj: Any) -> tuple[str, dict[str, Any]]:
+    """Extract (method, params) from a zendriver CDP command generator.
+
+    The generator yields ``{"method": ..., "params": {...}}`` and expects the
+    reply to be *sent back* into it; the coerced value comes out through
+    ``StopIteration.value``. Callers must keep the generator alive and send it
+    the raw result — that is what produces typed ``cdp.dom.Node`` objects.
+    """
+    if not hasattr(cdp_obj, "__next__"):
+        raise TypeError(f"Expected a CDP command generator, got {type(cdp_obj)!r}")
+
+    payload = next(cdp_obj)
+    if not isinstance(payload, dict) or "method" not in payload:
+        raise TypeError(f"Unexpected CDP payload: {payload!r}")
+
+    return payload["method"], payload.get("params") or {}
+
+
+# --------------------------------------------------------------------------
+# Attaching
+# --------------------------------------------------------------------------
+
+async def probe_ws(url: str, timeout: float = 6.0) -> bool:
+    """Confirm the endpoint answers a CDP handshake.
+
+    A port file on disk proves nothing: Chrome leaves it behind after a crash,
+    and approval can be revoked while the file still lists a live port. The only
+    reliable check is to open a socket and ask for the version.
+    """
+    sock = BrowserSocket(url)
+    try:
+        await sock.connect(timeout=timeout)
+        version = await sock.send("Browser.getVersion", timeout=timeout)
+        return bool(version.get("product"))
+    except Exception:
+        return False
+    finally:
+        with contextlib.suppress(Exception):
+            await sock.close()
+
+
+async def open_session(
+    socket: BrowserSocket,
+    target_id: str,
+    info: dict[str, Any],
+) -> RawTab:
+    """Attach a flat session to a target and enable the domains we need.
+
+    Every new session starts with no domains enabled. ``DOM.getDocument`` and
+    ``Page.getFrameTree`` fail with -32601 until ``DOM.enable`` / ``Page.enable``
+    run on that session, so this must happen per tab, not once per browser.
+    """
+    attached = await socket.send(
+        "Target.attachToTarget",
+        {"targetId": target_id, "flatten": True},
+    )
+    session_id = attached["sessionId"]
+    tab = RawTab(socket, target_id, session_id, info)
+
+    for domain in ("Page.enable", "DOM.enable", "Runtime.enable"):
+        with contextlib.suppress(Exception):
+            await socket.send(domain, {}, session_id=session_id)
+
+    return tab
+
+
+async def list_targets(socket: BrowserSocket) -> list[dict[str, Any]]:
+    res = await socket.send("Target.getTargets")
+    return [t for t in res.get("targetInfos", []) if t.get("type") == "page"]
+
+
+async def attach(
+    session: Any,
+    *,
+    user_data_dir: Path | str | None = None,
+    ws_url: str | None = None,
+    timeout: float = 15.0,
+    tab_index: int | None = None,
+    target_id: str | None = None,
+) -> dict[str, Any]:
+    """Attach ``session`` to a running Chrome and select a tab.
+
+    Returns a summary safe to hand to an agent: endpoint, tab count, and the
+    selected tab's URL and title.
+    """
+    if ws_url is None:
+        ws_url = ws_endpoint(user_data_dir)
+
+    socket = BrowserSocket(ws_url)
+    try:
+        await socket.connect(timeout=timeout)
+    except Exception as exc:
+        raise AttachError(
+            f"Could not open {ws_url}.\n"
+            "Three things cause this, in order of likelihood:\n"
+            "  1. Another client already holds the connection. Chrome's "
+            "approval-mode debugging serves one client at a time, so stop any "
+            "other MCP server or script that is attached.\n"
+            "  2. The approval expired. Re-approve at "
+            "chrome://inspect/#remote-debugging.\n"
+            "  3. Chrome was closed or the port changed."
+        ) from exc
+
+    try:
+        version = await socket.send("Browser.getVersion")
+    except Exception as exc:
+        await socket.close()
+        raise AttachError(
+            f"Connected to {ws_url} but Browser.getVersion failed: {exc}"
+        ) from exc
+
+    pages = await list_targets(socket)
+    if not pages:
+        await socket.close()
+        raise AttachError("Chrome is running but has no page targets open.")
+
+    # Pick a tab: explicit target id, explicit index, then the first real page.
+    if target_id is not None:
+        chosen = next((p for p in pages if p["targetId"] == target_id), None)
+        if chosen is None:
+            await socket.close()
+            raise AttachError(f"No page target with id {target_id!r}")
+    elif tab_index is not None:
+        try:
+            chosen = pages[tab_index]
+        except IndexError as exc:
+            await socket.close()
+            raise AttachError(
+                f"No tab at index {tab_index}; {len(pages)} page(s) open."
+            ) from exc
+    else:
+        chosen = next(
+            (p for p in pages
+             if p.get("url") not in ("about:blank", "chrome://newtab/", "")),
+            pages[0],
+        )
+
+    try:
+        tab = await open_session(socket, chosen["targetId"], chosen)
+    except Exception as exc:
+        await socket.close()
+        raise AttachError(f"Could not attach to the tab: {exc}") from exc
+
+    session._browser = _BrowserShim(socket, pages)
+    session._tab = tab
+    session._targets.clear()
+    if hasattr(session, "_headless"):
+        session._headless = False
+
+    return {
+        "attached": True,
+        "endpoint": ws_url,
+        "browser": version.get("product"),
+        "tabs": len(pages),
+        "active_url": chosen.get("url"),
+        "active_title": chosen.get("title"),
+        "tab_list": [
+            {"index": i, "title": p.get("title"), "url": p.get("url")}
+            for i, p in enumerate(pages)
+        ],
+    }
+
+
+class _BrowserShim:
+    """Just enough ``Browser`` surface for ``browser.py``'s tab helpers.
+
+    ``tabs`` must expose ``switch_tab`` and ``tabs`` list-style access. Each
+    entry carries its target id; a flat session is opened lazily the first time
+    a tab is actually driven, because sessions are per-tab and must not be
+    created speculatively.
+    """
+
+    def __init__(self, socket: BrowserSocket, pages: list[dict[str, Any]],
+                 session: Any = None) -> None:
+        self._socket = socket
+        self._pages = pages
+        self._session = session
+        self.tabs: list[RawTab] = [RawTab(socket, p["targetId"], "", p)
+                                   for p in pages]
+
+    def _info_for(self, target_id: str) -> dict[str, Any]:
+        return next((p for p in self._pages if p["targetId"] == target_id), {})
+
+    async def open(self, index: int) -> RawTab:
+        """Attach a live session to the tab at ``index`` and return it."""
+        if index < 0 or index >= len(self._pages):
+            raise AttachError(f"No tab at index {index}")
+        info = self._pages[index]
+        return await open_session(self._socket, info["targetId"], info)
+
+    async def refresh(self) -> list[dict[str, Any]]:
+        pages = await list_targets(self._socket)
+        self._pages = pages
+        self.tabs = [RawTab(self._socket, p["targetId"], "", p) for p in pages]
+        return pages

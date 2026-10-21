@@ -1,0 +1,7 @@
+# Runtime
+zendriver>=0.16.0
+mcp>=1.27.0
+websockets>=13.0
+
+# test_hands.py only
+# (no extra dependencies: it uses http.server from the stdlib)

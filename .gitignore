@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Test and debug artefacts
+.pytest_cache/
+*.log
+_probe.mjs
+_diag.mjs
+_repro.mjs
+
+# Local profiles and screenshots
+profile/
+*.png
+shot-*.png
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
