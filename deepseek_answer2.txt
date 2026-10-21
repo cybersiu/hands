@@ -1,0 +1,73 @@
+settled >= 2 不夠擋 redirect hop。
+
+你仲有 or state["ready"] == "complete"：第一次 moved && complete 就 return，settled 根本冇機會生效。
+
+兩次 40ms poll 只係大約 80ms quiet window；client-side redirect、setTimeout(() => location=...)、meta refresh、SPA 再跳，可以 100ms 後才發生。Intermediate document 只要 ready != "loading" 80ms 就漏。
+
+moved 係 href OR hist OR t0，任何無關 history 變化都會當 moved；而你傳入的 loader_id 在 _wait_document 完全冇用，無法確認 settle 的是你等的那次 navigation。
+
+不加 event 的更簡單寫法：移除 or complete 即時 return；改成 moved 後要求 href + timeOrigin + frame.loaderId + navigation history current entry 連續穩定 Q ms（例如 300–500ms），並且 readyState === "complete"。用 Page.getFrameTree 的 frame.loaderId 和 Page.getNavigationHistory，不要用 history.length 做 identity。呢個仍然係 heuristic；delayed redirect 超過 Q 一樣漏。要正確擋 redirect hop，本質上要 Page.frameNavigated / Page.lifecycleEvent 或至少持續 poll loaderId 到 final loader 穩定；冇 event 只能 tradeoff timeout/quiet window。
+
+readyState == "complete" 即刻 return 太早。
+
+complete 只代表 document load 完，不代表 app ready：SPA hydration、route render、modal、lazy data 可以之後才有。
+
+而且你現在 complete 即 return，連 redirect quiet window 都跳過。
+
+應該分兩層：document settled（commit/load + final URL + loader stable）同 app ready（network idle、自訂 JS flag、DOM mutation quiet、caller predicate）。navigate default 可以等 document load；另外 wait_app_ready()，唔好硬塞入 navigate。
+
+Event queue 滿了丟最舊，會丟關鍵事件。
+
+高頻 event 通常係 Network.dataReceived、Runtime.consoleAPICalled 之類；最舊嗰件可能正正係 Page.frameNavigated、Target.attachedToTarget、Runtime.executionContextCreated、Page.lifecycleEvent。丟咗會令 waiter timeout、routing 錯、unknown session message，而且 silent。
+
+正確做法：分類。
+
+Critical/control：Target.*、Page.frameNavigated、Page.frameStartedNavigating、Page.frameStoppedLoading、Page.lifecycleEvent、Page.loadEventFired、Page.domContentEventFired、Runtime.executionContextCreated/Destroyed、Inspector.detached、dialog 類。呢啲唔可以隨便丟；獨立 queue/deque，滿就 fail loudly/close session，或至少保留 latest per key（frameId/loaderId/targetId）並記錄 drop。
+
+High-volume：ring buffer / coalesce by key，滿可丟，但要 expose drop counter。
+
+Target.attachedToTarget 最好優先/inline 處理，否則 attach event 被丟，後面 session message 會 route 唔到。
+
+加 sequence/gap detection；critical queue 滿要 raise，唔好靜默。
+
+Click 用 before/after URL 判斷「有冇效果」係錯的。
+
+Click 本質只保證 event dispatched，唔保證 app 成功。SPA modal URL 不變可以成功；按鈕只 analytics 冇 DOM 變化也可能成功；preventDefault 也可能係正常。
+
+應該 return structured result，而唔係 boolean：
+
+pre-click：snapshot URL/history/timeOrigin/loaderId；install MutationObserver counter；CDP network request counter；dialog/focus/visibility；check element hit target。
+
+post-click 等 bounded window，睇第一種 effect：
+
+navigation：loaderId/URL/timeOrigin/history 變 → 等 navigate；same-document URL 變 → success_nav_same_doc。
+
+無 navigation 但有 effect：mutation count > 0、新 network request、dialog、visibility/aria/focus 變、console error → success_no_navigation。
+
+完全冇 observable effect → no_observable_effect，唔一定等於失敗。
+
+如果 caller 要 boolean，要傳 expected predicate，例如「modal selector 變 visible」「route container 文字變」「request URL 出現」。timeout 只係相對 predicate 失敗。
+
+真正失敗：element not found/not clickable、hit test mismatch、dispatch error、Runtime.exceptionThrown、caller predicate timeout。
+
+Silent-truth bugs：
+
+loader_id 參數冇用：可能 settle 到錯 navigation/舊 document/無關 history 變化。要綁 frameId + loaderId + navigation entry id。
+
+_safe_url 讀失敗回空字串，但空字串唔係合法 URL truth；如果 _nav_state 將佢當 href，會 moved=true，可能 settle 在 context destroyed/blank/error。讀失敗要回 invalid，reset settled，唔好當 URL。
+
+history.length 唔係 navigation identity：same URL replaceState 可以完全冇變；unrelated pushState 又可以令你 false positive；長度有 cap。用 Page.getNavigationHistory current entry id/index。
+
+performance.timeOrigin 只保證 cross-document 變；same-document navigation 唔變。你靠佢 reload same URL OK，但唔係通用。
+
+Page.navigate 的 errorText / net error 冇檢查：error page 都可以 readyState complete，會回報成功。HTTP 404/500 亦會當 document load 成功；要唔要當失敗係語義問題，但唔好 silent。
+
+_nav_state 冇 per-eval timeout；sleep + eval 可以超過 deadline。timeout 後 navigation 可能仍在跑，caller state 要清理。
+
+多 frame/iframe：你讀 location.href 係邊個 context/frame？iframe navigation 主 frame 唔變會 timeout；要 frameId/contextId。
+
+Event queue drop critical 會令 routing/waiter silent 失敗；browser bucket 丟 Target.* 尤其危險。
+
+before snapshot 同 navigate 開始之間有 race；page 自己先 navigate 會令 before stale。最好用 Page.navigate 回傳的 frameId/loaderId 做 expected。
+
+navigate return 時 URL 係當刻 truth，但 SPA 之後可以再 pushState；如果你承諾「最終 URL」要等 app ready 或明確 quiet window。

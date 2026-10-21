@@ -74,6 +74,33 @@ async def test_pushstate_route():
     print("  pushState route         -> detected via history.length")
 
 
+async def test_redirect_hop_is_not_mistaken_for_the_end():
+    """An intermediate document that reports complete must not end the wait.
+
+    This is the case the first version got wrong: it returned on the first
+    ``readyState === complete``, which is exactly what a redirect hop looks
+    like. The hop here lasts ~120ms, well under the 240ms quiet window.
+    """
+    before = state("https://a.test/", "complete", t0=1.0)
+    mid = [state("https://a.test/mid", "complete", t0=2.0)] * 3
+    final = [state("https://a.test/final", "complete", t0=3.0)] * 20
+    tab = ScriptedTab(mid + final)
+    await tab._wait_document(before, "L1", timeout=5)
+    assert tab._last["href"] == "https://a.test/final", tab._last
+    print("  redirect hop            -> waited for the final document")
+
+
+async def test_unreadable_document_does_not_settle():
+    """A destroyed context returns no href; that is not a finished navigation."""
+    before = state("https://a.test/", "complete", t0=1.0)
+    blank = [{"href": "", "ready": "complete", "t0": 0.0, "hist": 0}] * 5
+    final = [state("https://b.test/", "complete", t0=2.0)] * 20
+    tab = ScriptedTab(blank + final)
+    await tab._wait_document(before, None, timeout=5)
+    assert tab._last["href"] == "https://b.test/", tab._last
+    print("  empty href              -> ignored, not treated as settled")
+
+
 async def test_no_navigation_times_out():
     before = state("https://a.test/")
     tab = ScriptedTab([state("https://a.test/")] * 200)
@@ -129,6 +156,8 @@ async def main() -> int:
         test_plain_navigation,
         test_same_url_reload,
         test_pushstate_route,
+        test_redirect_hop_is_not_mistaken_for_the_end,
+        test_unreadable_document_does_not_settle,
         test_no_navigation_times_out,
         test_navigate_refusal,
         test_safe_url_is_live,

@@ -122,6 +122,28 @@ def ws_endpoint(user_data_dir: Path | str | None = None) -> str:
 # Flat-session CDP transport
 # --------------------------------------------------------------------------
 
+#: Events that must not be dropped when a queue overflows. They are the ones
+#: that carry navigation identity or session routing; losing one means a waiter
+#: times out for no visible reason.
+_CRITICAL_EVENTS = frozenset({
+    "Page.frameNavigated",
+    "Page.frameStartedNavigating",
+    "Page.frameStoppedLoading",
+    "Page.lifecycleEvent",
+    "Page.loadEventFired",
+    "Page.domContentEventFired",
+    "Page.navigatedWithinDocument",
+    "Runtime.executionContextCreated",
+    "Runtime.executionContextDestroyed",
+    "Runtime.executionContextsCleared",
+    "Inspector.detached",
+})
+
+
+def _is_critical(method: str | None) -> bool:
+    return bool(method) and (method in _CRITICAL_EVENTS or method.startswith("Target."))
+
+
 class BrowserSocket:
     """One WebSocket to Chrome, multiplexing many flat sessions.
 
@@ -140,6 +162,9 @@ class BrowserSocket:
         # its own bucket because browser-scoped events (Target.*) omit the
         # session id by design, which is not an error.
         self._events: dict[Any, asyncio.Queue] = {}
+        #: How many events were discarded under pressure. A non-zero value here
+        #: means an event consumer may have missed something.
+        self.dropped = 0
 
     async def connect(self, timeout: float = 10.0) -> None:
         import websockets
@@ -163,16 +188,29 @@ class BrowserSocket:
 
                 # No id: a CDP event. Dropping these (the previous behaviour)
                 # makes Page.frameNavigated and friends unusable, so queue them
-                # per session. A bounded queue keeps a chatty page from growing
-                # without limit; the oldest event is the least useful one.
+                # per session. When the queue is full the oldest *droppable*
+                # event goes first: losing a console message is harmless,
+                # losing frameNavigated makes a waiter hang with no error.
                 sid = msg.get("sessionId")
                 queue = self._events.get(sid)
                 if queue is None:
                     queue = asyncio.Queue(maxsize=512)
                     self._events[sid] = queue
                 if queue.full():
-                    with contextlib.suppress(asyncio.QueueEmpty):
-                        queue.get_nowait()
+                    kept = []
+                    dropped = False
+                    while not queue.empty():
+                        item = queue.get_nowait()
+                        if not dropped and not _is_critical(item.get("method")):
+                            dropped = True
+                            continue
+                        kept.append(item)
+                    if not dropped:
+                        # Everything queued was critical; drop the oldest.
+                        kept.pop(0)
+                    for item in kept:
+                        queue.put_nowait(item)
+                    self.dropped += 1
                 queue.put_nowait(msg)
         except Exception:
             pass
@@ -396,57 +434,88 @@ class RawTab:
         return self
 
     async def _nav_state(self) -> dict[str, Any]:
+        """Document identity, readiness and loader id, in as few trips as possible."""
         try:
             state = await self.evaluate(_NAV_STATE_JS)
         except Exception:
             return {}
-        return state if isinstance(state, dict) else {}
+        if not isinstance(state, dict):
+            return {}
 
-    async def _wait_document(self, before: dict[str, Any],
-                             loader_id: Any, timeout: float) -> None:
-        """Poll until the document that replaced ``before`` is usable.
+        # loaderId is the only value that identifies *which* document is loaded;
+        # it changes when a redirect produces a new document. The frame tree is
+        # one extra round trip and its failure is not fatal.
+        state["loader"] = None
+        if self._socket is not None:
+            try:
+                tree = await self._socket.send(
+                    "Page.getFrameTree", session_id=self.session_id, timeout=3.0
+                )
+                frame = ((tree or {}).get("frameTree") or {}).get("frame") or {}
+                state["loader"] = frame.get("loaderId")
+            except Exception:
+                pass
+        return state
 
-        Three signals are needed because none is sufficient alone:
+    async def _wait_document(self, before: dict[str, Any], loader_id: Any,
+                             timeout: float, quiet_ms: float = 240.0) -> None:
+        """Poll until the document that replaced ``before`` is stable.
 
-        * ``location.href`` changes for ordinary navigations but not reloads.
-        * ``performance.timeOrigin`` changes on every new document, including a
-          reload of the same URL.
-        * ``history.length`` catches pushState routes that add an entry.
+        A settled page means three things at once: the identity changed from
+        the pre-navigation snapshot, the identity stopped changing for a quiet
+        window, and ``readyState`` left ``loading``.
 
-        ``document.readyState`` is the completion condition, but only once one
-        of the identity signals has fired — otherwise a slow page that has not
-        started navigating yet would look "ready".
+        The quiet window is what protects against redirect hops. Returning as
+        soon as ``readyState === "complete"`` looks correct and is not: a
+        client-side redirect can fire 100 ms after an intermediate document
+        reports complete, and the caller then reads the URL of a page that is
+        already leaving.
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
-        settled = 0
+        before_key = (before.get("href"), before.get("t0"))
+
+        key: tuple[Any, Any, Any] | None = None
+        quiet_since: float | None = None
+        changed = False
         last: dict[str, Any] = before
 
         while loop.time() < deadline:
             await asyncio.sleep(0.04)
             state = await self._nav_state()
-            if not state:
-                continue
-            last = state
 
-            moved = (
-                state.get("href") != before.get("href")
-                or state.get("hist") != before.get("hist")
-                or state.get("t0") != before.get("t0")
-            )
-            if moved and state.get("ready") != "loading":
-                settled += 1
-                # Two consecutive ready polls rule out a redirect hop that
-                # looked interactive for a frame.
-                if settled >= 2 or state.get("ready") == "complete":
-                    return
-            else:
-                settled = 0
+            # An unreadable document (context destroyed mid-navigation) is not
+            # evidence of anything; it must not count as a settled page.
+            if not state or not state.get("href"):
+                quiet_since = None
+                continue
+
+            last = state
+            if (state.get("href"), state.get("t0")) != before_key:
+                changed = True
+
+            new_key = (state.get("href"), state.get("t0"), state.get("loader"))
+            if new_key != key:
+                key = new_key
+                quiet_since = loop.time()
+                continue
+
+            if state.get("ready") == "loading":
+                quiet_since = None
+                continue
+
+            if quiet_since is None:
+                quiet_since = loop.time()
+                continue
+
+            if changed and (loop.time() - quiet_since) * 1000.0 >= quiet_ms:
+                return
 
         raise AttachError(
             f"Navigation did not settle within {timeout}s "
             f"(before={before.get('href')!r} now={last.get('href')!r} "
-            f"ready={last.get('ready')!r} loaderId={loader_id!r})"
+            f"ready={last.get('ready')!r} loaderId={last.get('loader')!r} "
+            f"firstLoaderId={loader_id!r} changed={changed})"
         )
 
     async def close(self) -> None:
