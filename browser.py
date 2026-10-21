@@ -82,6 +82,27 @@ _ELEMENT_NODE = 1
 #: How deep to walk the pierced DOM. Guards against pathological trees.
 _MAX_DEPTH = 40
 
+#: Iframes whose document this context may not read. A cross-site frame is a
+#: separate target, so neither the pierced DOM nor ``contentDocument`` reaches
+#: it; the page itself can still name it, which is the point.
+_INACCESSIBLE_FRAMES_JS = """(() => {
+  const out = [];
+  const walk = (doc, depth) => {
+    if (!doc || depth > 6) return;
+    for (const frame of doc.querySelectorAll('iframe,frame')) {
+      let inner = null;
+      try { inner = frame.contentDocument; } catch (e) { inner = null; }
+      if (!inner) {
+        out.push(frame.src || '(no src)');
+      } else {
+        walk(inner, depth + 1);
+      }
+    }
+  };
+  walk(document, 0);
+  return out;
+})()"""
+
 
 class HandsError(RuntimeError):
     """A failure whose message is safe and useful to show an agent."""
@@ -444,9 +465,11 @@ class Session:
     ) -> dict[str, Any]:
         """Return interactable elements with viewport coordinates.
 
-        Walks the *pierced* DOM: shadow roots and cross-origin iframes are
-        included because ``DOM.getDocument(pierce=True)`` returns one node tree
-        spanning every frame the renderer knows about.
+        Walks the *pierced* DOM: shadow roots and same-process iframes are
+        included. A cross-site iframe is a separate target (an OOPIF) and its
+        nodes are **not** in this tree; those frames are listed in
+        ``frames_outside_tree`` so that "no controls here" can be told apart
+        from "controls I could not see". ``test_oopif.py`` pins that boundary.
         """
         tab = self._require_tab()
         self._targets.clear()
@@ -463,7 +486,6 @@ class Session:
             # A node inside a frame reports its own frame id; trust it over the
             # inherited one so cross-origin frames are attributed correctly.
             own_frame = _get(node, "frame_id") or frame_id
-
             if _get(node, "node_type") == _ELEMENT_NODE:
                 maybe = self._classify(node, own_frame, shadow_depth)
                 if maybe is not None:
@@ -485,8 +507,8 @@ class Session:
                 await visit(root, frame_id=own_frame,
                             shadow_depth=shadow_depth + 1, depth=depth + 1)
 
-            # With pierce=True the renderer inlines frame documents here,
-            # including cross-origin ones.
+            # With pierce=True a same-process frame's document is inlined here.
+            # A cross-origin frame is not: it belongs to its own target.
             content = _get(node, "content_document")
             if content is not None:
                 await visit(content, frame_id=own_frame,
@@ -511,8 +533,25 @@ class Session:
             "count": len(targets),
             "truncated": len(targets) >= max_nodes,
             "viewport": info,
+            "frames_outside_tree": await self._inaccessible_frames(),
             "elements": [t.as_dict() for t in targets],
         }
+
+    async def _inaccessible_frames(self) -> list[str]:
+        """URLs of iframes whose document this session cannot read.
+
+        A cross-site iframe is a separate target: ``DOM.getDocument`` returns
+        no nodes for it, and script in the parent cannot touch its
+        ``contentDocument``. Asking the page which frames are opaque is the
+        only check that cannot be fooled by a stub document or a missing
+        target listing. Without it, "no controls" and "controls I could not
+        see" look identical.
+        """
+        try:
+            frames = await self.evaluate(_INACCESSIBLE_FRAMES_JS)
+        except Exception:
+            return []
+        return [f for f in frames or () if isinstance(f, str)]
 
     async def _repair_texts(self, tab: uc.Tab,
                             targets: list[Target]) -> None:
